@@ -1,0 +1,44 @@
+# SecorizonAI — single-user container.
+#
+# Usage:
+#   docker compose run --rm secorizon            # interactive session
+#   SECORIZON_MODEL=my-agent docker compose run --rm secorizon
+#
+# The build context is the package root (one level up) so the Dockerfile can
+# COPY chat.go and go.mod from there.
+
+services:
+  secorizon:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: secorizon-ai:latest
+    container_name: secorizon
+    stdin_open: true        # -i
+    tty: true               # -t
+
+    environment:
+      # Talk to Ollama running on the Docker host (Linux/macOS).
+      # If your Ollama runs in another container or remote host, change this.
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      SECORIZON_MODEL: ${SECORIZON_MODEL:-secorizon:latest}
+
+    # On Linux, host.docker.internal isn't auto-mapped. This adds it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # Per-session config + history + memory. Bind-mounted so it survives
+      # container removal and you can edit SECORIZON.md on the host.
+      - ./secorizon-config:/home/secorizon/.secorizon
+
+      # Engagement working directory — drop target codebases, scope files,
+      # captures here. Reports auto-saved to ~/reports/ inside the container
+      # land in ./reports on the host.
+      - ./engagement:/home/secorizon/engagement
+      - ./reports:/home/secorizon/reports
+
+    # No port mappings, no exposed ports. The container talks OUT (to Ollama,
+    # to engagement targets); nothing talks in. If you need to expose a tool
+    # (e.g. a local listener for credential capture during a controlled test),
+    # add a `ports:` block deliberately.
