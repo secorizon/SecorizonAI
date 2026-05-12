@@ -1,0 +1,24 @@
+# Build artifacts — `go build -o secorizon ./chat.go` produces this
+secorizon
+secorizon-go
+
+# Go misc
+*.exe
+*.test
+*.out
+vendor/
+
+# User runtime data — never commit
+.secorizon/
+~/.secorizon/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Docker compose runtime dirs (per docker/README.md)
+docker/secorizon-config/
+docker/engagement/
+docker/reports/
