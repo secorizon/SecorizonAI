@@ -93,7 +93,7 @@ That's it. It's a terminal-native ReAct loop with a curated system prompt and me
 - **Single-user assumed.** Run the binary directly on your AI server, or — recommended — inside the `docker/` container so the agent's commands are sandboxed.
 - **No telemetry, no auth on the binary itself.** Anyone with terminal access runs as you. Don't expose the chat shell to untrusted users; the container only isolates the *agent* from your filesystem, not other humans from the agent.
 - **No safety wheels.** The default system prompt explicitly tells the model to execute commands, fetch URLs, and act autonomously. This is intentional — it's a tool for security professionals. Treat the agent like a junior team member with sudo: capable, useful, and worth supervising.
-- **Multi-user SSH deployments** (one shared SecorizonAI+Burp container, isolated home dirs per engineer) are part of the [SecorizonAI Pro](https://secorizon.com/secorizonai) license.
+- **Multi-user SSH deployments** (one shared SecorizonAI container, isolated home dirs per engineer) are part of the [SecorizonAI Pro](https://secorizon.com/secorizonai) license.
 
 ---
 
