@@ -60,27 +60,28 @@ How the shell actually works internally. Read this if you want to extend it, deb
 
 ## File breakdown
 
-The whole shell is one file: `chat.go` (~2,400 lines). Sections in declaration order:
+The whole shell is one file: `chat.go` (~5,200 lines). Sections in declaration order:
 
-| Lines | Section | What it does |
-|---|---|---|
-| 1–25 | Imports + colors | Standard library + golang.org/x/term + ANSI color constants |
-| 30–110 | Globals | Default model, paths, danger filters, mode toggles |
-| 115–340 | Burp MCP client | Optional: integration with PortSwigger Burp Suite via MCP. Opt-in via `/burp`. |
-| 295–410 | Web search | DuckDuckGo HTML scrape, returns top 5 results as text |
-| 415–445 | technicalPrompt | The JSON-output schema instructions appended to SECORIZON.md |
-| 450–510 | Helpers | envOr, expandHome, mkdirAll, mkdirPrivate, etc. |
-| 510–530 | Config loader | Resolves SECORIZON.md path, reads it |
-| 535–580 | Memory | Saves/loads short notes between sessions |
-| 585–620 | History | Last-1000-inputs persistence for arrow-up recall |
-| 620–890 | Raw-mode reader | readLine + readLineRaw + readLineCooked |
-| 895–1080 | Ollama client | chatRequest/chatResponse types, /api/chat call, streaming |
-| 1085–1245 | Network checks | Detect "internet down" vs "command failed" patterns |
-| 1250–1340 | Command danger filters | dangerousBins, dangerousSubstrings, isDangerous() |
-| 1345–1530 | Command runner | runCommand: spawn bash, capture output, timeouts, backgrounding |
-| 1535–1620 | Conversation classifier | isUserDirectedQuestion, isConversational hints |
-| 1625–1700 | Banner + help | The startup graphic + /help text |
-| 1705–end | main() | Initialization, slash command dispatch, the chat loop |
+Sections, in declaration order (search for each section's leading function or constant to jump to it):
+
+| Section | Purpose |
+|---|---|
+| Imports + ANSI colors | Standard library + `golang.org/x/term`; color constants used everywhere. |
+| Globals | Default model, paths, mode toggles, danger filter tables, pending-bg-results queue. |
+| Burp MCP client (`BurpMCP`, `connect`, `sendRPC`, `discoverTools`, `callTool`, `toolsManifest`, `dispatchBurpMCP`, `normalizeBurpURL`) | Optional integration with PortSwigger Burp Suite via MCP. Opt-in via `/burp`. Implements both MCP-over-HTTP-POST and MCP-over-SSE; no MCP library dependency. |
+| Web search (`webSearch`) | DuckDuckGo HTML scrape; returns top 5 results as a text block. |
+| `technicalPrompt` | The JSON-output schema instructions appended to `SECORIZON.md` at runtime. |
+| Helpers (`envOr`, `expandHome`, `mkdirPrivate`, `sanitizeForTerminal`, etc.) | Small utility functions used throughout. |
+| Config loader (`loadSystemPrompt`) | Resolves `SECORIZON.md` path (env override → system-wide → per-user) and reads it. |
+| History (`saveHistory`, `loadInputHistory`, `saveInputHistory`) | Session transcript + arrow-up input recall. |
+| Raw-mode reader (`readLine`, `readLineRaw`, `readLineCooked`) | Terminal input with paste support, prompt redraw, bracketed-paste, Ctrl+D handling. |
+| Ollama client (`chatRequest`, `chatResponse`, `ollamaChat`, `unloadOllamaModel`, `listLoadedModels`, `modelDiskSizeMB`, `modelSupportsThinking`) | All HTTP traffic to Ollama. The per-request `keep_alive` lives here. |
+| GPU detection (`detectGPUs`, `recommendCtx`, `snapCtx`) | Shells out to `nvidia-smi` once at startup and computes a sensible default context window. |
+| Network checks (`networkFailureReason`, `checkNetworkUp`) | Distinguishes "the internet is down" from "this one target is broken". |
+| Danger filters (`dangerousBins`, `dangerousSubstrings`, `dangerousRedirRe`, `safeRedirTargets`, `extractShellCBody`, `checkBinDanger`, `isDangerous`) | Pre-execution command screening (see "Command execution" below). |
+| Command runner (`runCommand`) | Spawns `bash -c`, captures output, applies timeouts, queues background results for the next model turn via `drainPendingBgResults`. |
+| Banner + `/help` (`printBanner`, `printHelp`) | The ASCII-art startup graphic + the `/help` slash-command screen. |
+| `main()` | Initialization (`detectGPUs`, evict-stale-models, load `SECORIZON.md`, discover guides), then the user-input + agent-step dispatch loop. |
 
 ## The chat loop in detail
 
@@ -169,14 +170,51 @@ The `format: json` enforcement in the Ollama request (`"format": "json"` in chat
 
 ## Command execution
 
-`runCommand()` (around line 1345) handles shell execution:
+`runCommand()` handles shell execution:
 
-1. **Filter check** — runs the command through `isDangerous()`. Hard refusals return immediately with an error message that gets fed to the model as the "output."
-2. **Confirmation gates** — for installer commands (`apt install`, `pip install`, etc.) and `sudo`-prefixed commands, prints a "(y/N)" prompt to the user.
-3. **Spawn** — `exec.CommandContext(ctx, "bash", "-c", cmd)` with a 30s default timeout.
-4. **Capture** — combined stdout+stderr; truncated to 32KB to prevent runaway logs from blowing the model's context.
-5. **Background fallback** — commands running >30s get auto-backgrounded; their output is redirected to `/tmp/secorizon_bg_<unix>.txt`. The model receives a "(command backgrounded after 30s)" notice and is told to move on.
+1. **Filter check** — runs the command through `isDangerous()`. The check has three layers:
+   - Substring match against a small list of obvious badness (`drop table`, `chmod 777`, fork-bomb, etc.).
+   - Redirect-to-system-paths regex (`> /etc/passwd`, `>> /boot/grub`). Pseudo-devices that are safe write targets (`/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/zero`, `/dev/tty*`, `/dev/fd/*`, `/dev/pts/*`) are explicitly allow-listed so common idioms like `cmd 2>/dev/null` don't trip the alarm. Stderr/fd redirects (`2>`, `&>`) are excluded from this check by the regex prefix.
+   - Per-binary danger rules (`rm /`, `dd of=/dev/sda`, `find -delete`, `mkfs.*`, `<pkg> install`, etc.). For `bash -c <body>` invocations, the body is **extracted and recursively passed back to `isDangerous`** rather than always flagged — only the actual contents of the `-c` body decide.
+2. **Confirmation gates** — `[dangerous]` prompts let the user approve or deny each match.
+3. **Spawn** — `exec.CommandContext(ctx, "bash", "-c", cmd)` with a 300s default timeout.
+4. **Capture** — combined stdout+stderr; truncated to prevent runaway logs from blowing the model's context.
+5. **Background fallback** — commands still running after 30s with no partial output are auto-backgrounded. The shell:
+   - Saves output to a unique temp file (`os.CreateTemp("", "secorizon_bg_*.txt")` — O_EXCL + random suffix so an attacker on shared `/tmp` can't pre-symlink it).
+   - Returns `(command backgrounded after 30s …)` to the model so it can keep working.
+   - **Auto-delivers the result** when the background command finally finishes: a synthetic user-role message is appended to `pendingBgResults`. The next call to `ollamaChat()` runs `drainPendingBgResults()` first, prepending those messages to the model's context. This eliminates the previous failure mode where the model would forget about the backgrounded command entirely and write "results pending" in its final report. Truncated to 8KB inline, with a `cat <file>` pointer to retrieve the rest.
+   - Hard timeout (5 min default) kills the bg process and enqueues a `[backgrounded command killed]` notice so the model retries differently instead of waiting forever.
 6. **`cd` handling** — `cd path` and `cd path && cmd` are intercepted; the working directory persists across commands.
+
+### Loop prevention
+
+The agent loop has several independent guards against no-progress spinning, layered cheapest-to-firmest:
+
+| Guard | Trigger | Action |
+|---|---|---|
+| `blockedCmds` set | A command was denied at the `[dangerous]` gate or already flagged broken | Re-issuing it is skipped with `[BLOCKED: …]` |
+| `emptyCmdStreak` | Model narrates without emitting a command N turns in a row (`5` default, `50` in `/bymodule`) | Stops the loop — the model isn't acting (or, in `/bymodule`, has finished its report) |
+| `emptyOutputStreak` | **3 consecutive commands return no output** (grep no-match, empty `ls`, etc.) | Blocks the repeated command and injects a `[NO-PROGRESS: …]` nudge telling the model to confirm the path with `ls`/`find`, broaden the pattern, or change approach. Resets on any non-empty output. |
+| identical-output-8× | The last 8 command outputs are byte-identical | Skips with `[BLOCKED: identical output 8x]` and clears the history |
+| `totalFails >= 15` | 15 unambiguously broken commands (`command not found`) | Hard stop — forces the model to emit its final report |
+
+The `emptyOutputStreak` guard specifically targets the tool-feedback loop where an empty result gives the model no new signal, so it regenerates the same reasoning sentence and a near-identical search. It fires faster than the identical-output-8× detector and is not defeated by interleaving one non-empty command. Note that empty/404/NXDOMAIN/refused outputs are deliberately **not** counted as failures toward the `15` cap — they're valid recon signal the model legitimately learns from.
+
+### Stats line — per-turn diagnostics
+
+After every model reply, the shell prints:
+
+```
+[secorizon:q5km] 5.8k tokens | prompt 994tk/s | gen 30.2tk/s | 9.4s total
+```
+
+Breakdown:
+- `[model]` — what was actually sent to Ollama this turn (catches silent mismatches between `/model` selection and what's loaded).
+- `tokens` — prompt-eval count + completion count combined.
+- `prompt NNNtk/s` — measured prompt-evaluation throughput. Drops from ~1000 → ~100-300 when the model is split across multiple GPUs (PCIe-bound) or partially CPU-offloaded.
+- `gen NN.Ntk/s` — generation throughput; the model's natural ceiling on this hardware/quant.
+- `load X.Xs` — **only printed when > 1s**. If you see it on every turn, the model is being evicted between requests (another client, missing `keep_alive`, or VRAM contention). Each load means a 30-120s reload of the full weights from disk.
+- `total Xs` — wall-clock duration.
 
 ## Web search
 
@@ -232,17 +270,23 @@ Three flags affect model invocation:
 | Flag | Effect | Set by |
 |---|---|---|
 | `thinkMode` | Adds "use `<think>...</think>` tags" to the system reminder; sets `chatRequest.Think = &true` for native think-mode on supported models | `/think` |
-| `fastMode` | Drops `numCtx` from 250000 to 65536 — KV cache fits on a single GPU, lower per-token latency | `/fast` |
-| `guidesEnabled` | Concatenates all `guides/*.md` files into the system prompt | `/guides` |
+| `fastMode` + `numCtx` | Default `numCtx = 250000` (250K) with `fastMode = false` — full depth out of the box. `/fast` toggles ON to a smaller, faster context (GPU-auto-sized via `recommendCtx`, else 16K). `/ctx <N>` sets an explicit value. Shrinking the window auto-calls `unloadOllamaModel(model)` so the next request reloads with the smaller KV cache — Ollama refuses to shrink a loaded instance. Placement hint after the new value is computed from `gpus.minMB` vs `modelMB + (numCtx * 200)/1024`. | `/fast`, `/ctx <N>`, `SECORIZON_NUM_CTX` |
+| `gpus` (GPU info) | Populated once at startup by `detectGPUs()` shelling out to `nvidia-smi --query-gpu=name,memory.total`. Used for the banner line and for the `/ctx`/`/fast` placement hint. Zero-value when no NVIDIA GPUs present — the binary stays usable on AMD / Apple / CPU-only setups; placement hints just disappear. | banner display |
+| `keep_alive` (per request) | Sent in every `/api/chat` payload as `KeepAlive: envOr("SECORIZON_KEEP_ALIVE", "24h")`. Pins the model in VRAM across turns, defending against any Ollama client/proxy chain that defaults the field to 0. | `SECORIZON_KEEP_ALIVE` |
+| Startup model eviction | `listLoadedModels()` is called in `main()` after greeting; any model that isn't `model` (the active selection) is unloaded with `keep_alive=0`. Prevents ping-pong eviction with other Ollama clients (e.g. concurrent SecInvest workers) that share the same daemon. | automatic; banner prints `evicted stale model from VRAM: <name>` |
+| `guidesEnabled` + `guidesLoaded` | Tracks which `guides/*.md` files have been opt-in injected into the system prompt. Off by default for fast cold start; user loads per-task via `/guides <name>`. The system prompt is rebuilt cleanly from `originalSystemPrompt` + currently-loaded guides on every change. | `/guides`, `/guides <name>`, `/guides all`, `/guides off` |
 
 These are simple booleans modified in slash-command handlers and read in `ollamaChat()`.
 
-## Memory + history
+## Session history
 
-Two persistence layers:
+Sessions are isolated. On `/exit`, the entire `messages` slice is serialized
+to `~/.secorizon/history/<date>_<time>.md` for postmortem review — but the
+next session starts fresh from `SECORIZON.md` and does not auto-resume.
 
-- **Conversation transcript.** On `/exit`, the entire `messages` slice is serialized to `~/.secorizon/history/<date>_<time>.md` for postmortem review. Not loaded back on the next run — sessions are isolated.
-- **Memory notes.** `~/.secorizon/memory/*.md` — short summaries the model itself writes via `echo "..." > ~/.secorizon/memory/file.md` commands. Currently disabled in the system prompt by default ("Memory is currently disabled" — see technicalPrompt). Re-enable by removing that line and adding memory-recall instructions to SECORIZON.md.
+User input history (the up-arrow buffer in the prompt) is persisted to
+`~/.secorizon/input_history` separately and IS loaded back on launch, so
+recent commands stay reachable across sessions.
 
 ## Where to extend
 

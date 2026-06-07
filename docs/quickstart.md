@@ -24,7 +24,11 @@ wget https://huggingface.co/<author>/<repo>/resolve/main/<model>.Q5_K_M.gguf
 # 3. Register with Ollama
 cat > Modelfile <<'EOF'
 FROM ./<model>.Q5_K_M.gguf
-PARAMETER num_ctx 32768
+# 65536 is the practical setting for a single 24GB GPU. Note the shell
+# itself defaults to 250K context (fast OFF) — on a 24GB card run /fast
+# or launch with SECORIZON_NUM_CTX=65536 so the request matches this and
+# Ollama doesn't reload (or OOM) on the first turn.
+PARAMETER num_ctx 65536
 EOF
 ollama create my-agent -f Modelfile
 
@@ -53,11 +57,16 @@ brew install ollama
 # or download the .app from https://ollama.com/download
 ```
 
-Start the daemon:
+Start the daemon. Set `OLLAMA_KEEP_ALIVE=24h` so the model stays resident in
+VRAM (the default unload timeout is 5 min — without this, you'll wait
+30 sec – 2 min on every "cold" prompt while the model reloads from disk):
+
 ```bash
-ollama serve &              # leaves it running in the shell
-# or, on systemd-based Linux:
-systemctl --user start ollama
+OLLAMA_KEEP_ALIVE=24h ollama serve &
+# or, on systemd:
+#   systemctl --user edit ollama.service
+#   add: Environment="OLLAMA_KEEP_ALIVE=24h"
+#   systemctl --user restart ollama
 ```
 
 Verify:
@@ -142,8 +151,11 @@ cd ~/models
 cat > Modelfile <<'EOF'
 FROM ./qwen2.5-14b-instruct-q5_k_m.gguf
 
-# Context window. Bigger = more memory. Most modern models support 32K+.
-PARAMETER num_ctx 32768
+# Context window. 65536 is the practical setting for a single 24GB GPU.
+# The shell defaults to 250K (fast OFF), so run /fast or SECORIZON_NUM_CTX=65536
+# to match this and avoid a slow reload / OOM on first turn. Bigger = more
+# KV-cache VRAM. Most modern models support 32K-128K.
+PARAMETER num_ctx 65536
 
 # Sampling. SecorizonAI overrides these per-request, but defaults matter
 # for `ollama run` testing.
@@ -194,6 +206,11 @@ For the system prompt structure and worked examples in different domains
 Methodology guides under `~/.secorizon/guides/` are optional — write your
 own, or license the production set ([SecorizonAI Pro](https://secorizon.com/secorizonai)).
 
+Guides are **off by default** at startup. Load only what the current task
+needs with `/guides <name>` — `/guides recon`, `/guides web`,
+`/guides code`, etc. See [custom-ai.md § Loading guides](custom-ai.md#loading-guides-at-the-prompt)
+for the full surface and alias system.
+
 ### Run, pointed at your model
 
 ```bash
@@ -210,11 +227,20 @@ echo 'export SECORIZON_MODEL=my-agent' >> ~/.bashrc
 You should see:
 
 ```
-  SecorizonAI v1.0 — el8 security research AI
+  SecorizonAI v1.2 — el8 security research AI
   Author: Laurent Gaffie  ·  https://secorizon.com  ·  twitter.com/secorizon
-  model: my-agent  │  /help for commands
+  model: secorizon:q5km  │  /help for commands
   Connected. Type anything. /exit to quit.
+  GPU: NVIDIA GeForce RTX 3090 (24GB) + NVIDIA GeForce RTX 3090 (24GB) · 48 GB total
+  context: 64K tokens
+  4 methodology guides available (off by default) — load with /guides <recon|web|code|methodology>
 ```
+
+The shell auto-detects GPUs at startup and prints what it found. If
+another model is already loaded in Ollama (e.g. a SecInvest worker
+holding a different tag warm), it gets unloaded so SecorizonAI's model
+gets uncontested headroom — you'll see `evicted stale model from VRAM: <name>`
+on the banner if that happens.
 
 For env vars, slash commands, paths, and defaults — see [configuration.md](configuration.md). For troubleshooting (Ollama unreachable, model JSON quality, OOM), see [installation.md § Troubleshooting](installation.md#troubleshooting).
 
@@ -222,7 +248,8 @@ For env vars, slash commands, paths, and defaults — see [configuration.md](con
 
 ## Next steps
 
-- [installation.md](installation.md) — Docker single-user and multi-user-with-SSH deployments.
+- [installation.md § What you'll see during a session](installation.md#what-youll-see-during-a-session) — analyzing spinner, command backgrounding, Ctrl+C semantics. Read this before your first session so the runtime UX makes sense.
+- [installation.md](installation.md) — Containerized (Docker) deployment shape, troubleshooting.
 - [custom-ai.md](custom-ai.md) — Repurpose for any domain. Write SECORIZON.md, drop in guides, same binary.
 - [configuration.md](configuration.md) — All env vars, slash commands, paths.
 - [architecture.md](architecture.md) — How the JSON tool-use loop actually works.

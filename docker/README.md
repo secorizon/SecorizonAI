@@ -26,7 +26,9 @@ docker compose build
 
 # 2. Drop your system prompt where the container expects it.
 #    (./secorizon-config/ on the host  →  ~/.secorizon/ in the container)
-#    Drop your own methodology guides into ./secorizon-config/guides/ as you write them.
+#    Drop your own methodology guides into ./secorizon-config/guides/ as you
+#    write them. Guides are off by default — load per-task in the shell with
+#    `/guides recon`, `/guides web`, etc. See docs/custom-ai.md for details.
 mkdir -p secorizon-config/guides engagement reports
 cp ../SECORIZON.Example.Pentester.md secorizon-config/SECORIZON.md
 $EDITOR secorizon-config/SECORIZON.md
@@ -132,6 +134,29 @@ OLLAMA_URL=http://gpu-box.local:11434 docker compose run --rm secorizon
 ```
 
 Just override the env var.
+
+### Environment variables
+
+All env vars work inside the container — pass them via `docker compose run -e`
+or bake them into the `environment:` block of `docker-compose.yml`:
+
+| Variable | Purpose |
+|---|---|
+| `OLLAMA_URL` | Where to reach Ollama (default `http://host.docker.internal:11434`) |
+| `SECORIZON_MODEL` | Model tag (default `secorizon:q5km`) |
+| `SECORIZON_NUM_CTX` | Context window in tokens (default `65536`). E.g. `SECORIZON_NUM_CTX=16384` for tight VRAM. |
+| `SECORIZON_KEEP_ALIVE` | Per-request keep_alive (default `24h`). Pins the model in VRAM across turns. |
+| `SECORIZON_CONFIG_DIR` | Override `~/.secorizon/` location inside the container. Pre-set to point at the mounted host config. |
+| `BURP_MCP_URL` | Default Burp MCP endpoint (only consulted when you run `/burp`). |
+
+Example one-liner with overrides:
+
+```bash
+docker compose run --rm \
+  -e SECORIZON_MODEL=secorizon:q5km \
+  -e SECORIZON_NUM_CTX=16384 \
+  secorizon
+```
 
 ---
 

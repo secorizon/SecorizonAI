@@ -89,7 +89,10 @@ ollama create my-agent -f Modelfile
 Where `Modelfile` looks like:
 ```
 FROM ./my-finetune.gguf
-PARAMETER num_ctx 32768
+PARAMETER num_ctx 65536   # practical for a 24GB GPU. The shell defaults to 250K
+                         # (fast OFF); on a single 24GB card run /fast or
+                         # SECORIZON_NUM_CTX=65536 so the request matches and
+                         # avoids a reload / OOM.
 SYSTEM "stub — overridden by SECORIZON.md anyway"
 ```
 
@@ -187,7 +190,10 @@ Drop that as `~/.secorizon/SECORIZON.md`, restart the shell, and you have a diff
 
 ## Adding methodology guides
 
-Guides are domain-specific playbooks loaded on `/guides` toggle. The user opts into the extra context when they want it.
+Guides are domain-specific playbooks. They are **discovered at startup but
+not loaded** — the user opts each one in with `/guides <name>` when the
+current task actually needs it. This keeps cold-start context small and
+inference fast.
 
 ### Format
 
@@ -202,6 +208,48 @@ guides/
 ```
 
 (No guides ship with this package — write your own, or license the production set from [SecorizonAI Pro](https://secorizon.com/secorizonai).)
+
+### Loading guides at the prompt
+
+```text
+/guides              # list available guides + which are currently loaded
+/guides recon        # inject recon-external.md into the system prompt
+/guides web          # inject webapp-offensive.md
+/guides code         # inject deep-code-review.md
+/guides methodology  # inject methodology.md (the high-level phase map)
+/guides all          # inject every guide in guides/ (legacy mass-load)
+/guides off          # strip every loaded guide — back to clean prompt
+```
+
+Guides accumulate within a session. Once loaded, they stay until `/guides off`
+or `/clear`. The system prompt is rebuilt cleanly each time so there's no
+duplication or stale content.
+
+### Alias system — `/guides <name>` lookup
+
+The short name you type resolves via three layers (last wins):
+
+1. **Built-in aliases** in the binary: `recon`, `web`, `webapp`, `code`,
+   `review`, `methodology`, `method`.
+2. **Auto-derived from filename**: for any guide `<stem>.md`, both `<stem>`
+   and the part before the first hyphen are auto-registered. So a new
+   file `mobile-pentest.md` is callable as `/guides mobile-pentest`
+   *or* `/guides mobile` with zero config.
+3. **`~/.secorizon/guides.aliases`** — optional user override file, plain
+   text, one mapping per line:
+
+   ```text
+   # alias    filename
+   recon:     recon-external.md
+   ad:        active-directory.md
+   r:         recon-external.md       # short shortcut for an existing guide
+   ```
+
+   Useful for renames, short shortcuts, or pointing one alias at a custom
+   guide that doesn't fit the auto-derive rules.
+
+The unresolved filename itself is always valid too — `/guides recon-external.md`
+works even with no aliases configured.
 
 ### When to write a guide vs. extend SECORIZON.md
 
@@ -285,13 +333,14 @@ guides/
 └── risk-management.md      # sizing, stops, correlation
 ```
 
-Each guide is its own deep playbook. The user toggles `/guides` when they want them loaded.
+Each guide is its own deep playbook. The user loads them per-task with `/guides macro-regime`, `/guides risk-management`, etc. — only paying the context cost for the phase they're in.
 
 ### 4. Run
 
 ```bash
 SECORIZON_MODEL=<your-model>:tag ./secorizon
-> /guides       # load methodology
+> /guides macro-regime    # load only what this task needs
+> /guides onchain-analysis
 > brief me on a long ETH swing — should I size for it?
 ```
 
