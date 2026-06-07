@@ -1,6 +1,8 @@
 # Build artifacts — `go build -o secorizon ./chat.go` produces this
 secorizon
 secorizon-go
+secorizon-test
+*.bak-*
 
 # Go misc
 *.exe

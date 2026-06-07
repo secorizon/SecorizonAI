@@ -47,12 +47,27 @@ curl -fsSL https://ollama.com/install.sh | sh
 # Or macOS via Homebrew
 brew install ollama
 
-# Start the daemon
-ollama serve &        # or systemctl --user start ollama on systems with the unit
+# Start the daemon. Set OLLAMA_KEEP_ALIVE=24h so the model stays resident in
+# VRAM instead of being unloaded after 5 minutes of inactivity (the default).
+# Without this you'll wait 30 sec – 2 min on the FIRST prompt of every session
+# while the model reloads from disk.
+OLLAMA_KEEP_ALIVE=24h ollama serve &
+# or, with systemd:
+#   systemctl --user edit ollama.service
+#   add: Environment="OLLAMA_KEEP_ALIVE=24h"
+#   systemctl --user restart ollama
 
 # Pull a model. Pick one based on your hardware — see custom-ai.md for guidance.
 ollama pull <your-chosen-model>:tag
 ```
+
+> **Why this matters:** Ollama unloads idle models from VRAM by default (5-min
+> timeout). For an interactive shell you reach for sporadically — pull a CVE,
+> read a writeup, come back — that's a 30-second-to-2-minute cold start every
+> time. `OLLAMA_KEEP_ALIVE=24h` keeps the model warm for a working day, so the
+> first response is as fast as the tenth. Trade-off: VRAM stays occupied. If
+> you share the GPU with other tools, drop the value (e.g., `1h`) or leave the
+> default.
 
 ### Step 2: Build the binary
 
@@ -74,6 +89,9 @@ mkdir -p ~/.secorizon/guides
 cp SECORIZON.Example.Pentester.md ~/.secorizon/SECORIZON.md
 $EDITOR ~/.secorizon/SECORIZON.md
 # Drop your own guides into ~/.secorizon/guides/ as you write them.
+# Guides are off by default — load per-task at the prompt with `/guides <name>`.
+# See docs/custom-ai.md § Loading guides for the alias system + optional
+# ~/.secorizon/guides.aliases override file.
 ```
 
 For the system prompt structure and worked examples in non-pentest domains,
@@ -82,18 +100,26 @@ see [custom-ai.md](custom-ai.md).
 ### Step 4: Run
 
 ```bash
-./secorizon                                       # uses SECORIZON_MODEL default
+./secorizon                                       # defaults to model secorizon:q5km, 250K context (fast OFF)
 SECORIZON_MODEL=<your-model>:tag ./secorizon      # override the model
+SECORIZON_NUM_CTX=16384 ./secorizon               # override default context window (tokens)
 ```
 
 You'll see the banner and prompt:
 
 ```
-  SecorizonAI v1.0 — el8 security research AI
+  SecorizonAI v1.2 — el8 security research AI
   Author: Laurent Gaffie  ·  https://secorizon.com  ·  twitter.com/secorizon
-  model: <your-model>:tag  │  /help for commands
+  model: secorizon:q5km  │  /help for commands
   Connected. Type anything. /exit to quit.
+  GPU: <auto-detected via nvidia-smi> · <total> GB total
+  context: 64K tokens
 ```
+
+The GPU line is populated from `nvidia-smi` at launch — it's informational
+(used to compute placement hints on `/ctx <N>`). If you have no NVIDIA
+GPU (AMD, Apple, CPU-only), the line shows `GPU: none detected` and the
+shell still runs against whatever Ollama is using.
 
 If you see "Cannot connect to Ollama" — make sure `ollama serve` is running
 and `OLLAMA_URL` (default `http://localhost:11434`) is reachable.
@@ -163,14 +189,91 @@ Start the VPN inside the container before launching the agent (manual `openvpn` 
 
 ```bash
 # Inside the chat shell
-> /help                # see available commands
-> ls                   # ask the agent to list files (it should run `ls`)
-> what model are you?  # asking the agent for its identity confirms config loaded
+> /help                                  # slash command — lists available commands
+> list the files in the current directory  # AI message — should make the agent run `ls`
+> what model are you?                    # AI message — confirms the system prompt loaded
+> !ls                                    # the `!` prefix runs a shell command directly, no AI
 ```
 
-If `/help` shows commands but `ls` does nothing, the JSON tool-use loop isn't
-firing. Check that the model you're using outputs valid JSON — see
-[custom-ai.md](custom-ai.md) for compatible models.
+The middle line is the real test: a natural-language request that should cause
+the agent to issue an `ls` command in its JSON tool-use loop. If `/help`
+works but the agent never actually runs commands when you ask it to, the
+JSON tool-use loop isn't firing. Check that the model you're using outputs
+valid JSON — see [custom-ai.md](custom-ai.md) for compatible models.
+
+---
+
+## What you'll see during a session
+
+A working session looks like a back-and-forth: you type, the agent thinks,
+runs commands, reads output, thinks again. The shell surfaces three runtime
+behaviors you should know about up front — they're normal, not errors.
+
+### `⠋ analyzing...` (the spinner)
+
+A unicode-braille spinner that runs between your input and the next response,
+and again after each command's output while the model decides what to do
+next. If your model takes 5–30 seconds per turn, expect to see this often.
+
+If the spinner runs for **2+ minutes on the first prompt**, the model is
+cold-loading from disk. That's the cold-start problem `OLLAMA_KEEP_ALIVE`
+solves — see Step 1 of the install above. Each turn ends with a stats
+line — if you see `load X.Xs` printed on every turn (not just the first),
+**another Ollama client is evicting your model**. See Troubleshooting below.
+
+If the spinner runs for **2+ minutes on every prompt** and the stats line
+shows `prompt < 200 tk/s` and `gen < 15 tk/s`, the model is too
+big for your VRAM and is partially CPU-offloading. Drop a quantization tier
+(Q5_K_M → Q4_K_M), shrink `/ctx`, or pick a smaller model.
+
+### Stats line — what the numbers mean
+
+```
+[secorizon:q5km] 5.8k tokens | prompt 994tk/s | gen 30.2tk/s | 9.4s total
+```
+
+- **`[secorizon:q5km]`** — the model that actually served this turn (catches mismatches between `/model` and what's loaded).
+- **`prompt NNNtk/s`** — context evaluation speed. ~1000 = model fits on one GPU. ~100-300 = split across GPUs / partial CPU offload.
+- **`gen NN.Ntk/s`** — generation speed; ceiling depends on model/quant/hardware.
+- **`load X.Xs`** — printed *only* when > 1s. Means the model was unloaded between this turn and the last one. If it shows up every turn, see Troubleshooting.
+
+### `(command backgrounded after 30s)`
+
+A shell command exceeded the 30-second timeout. Rather than block the
+agent loop indefinitely, the shell **moves the command to the background**
+and:
+
+- Saves its output to `/tmp/secorizon_bg_<unix>.txt` once it completes
+- Tells the model "(command backgrounded after 30s)" as the command's "output"
+- Lets the model continue (typically: do something else, then circle back)
+- **Auto-delivers the result when the bg command finishes** — the next time
+  the model is called, a synthetic `[backgrounded command completed]` user
+  message is prepended to its context with the captured output (first 8KB
+  inline, with a `cat <file>` pointer to read the rest). This is critical:
+  without it, the model would silently forget the backgrounded command
+  produced any data and could write things like "results pending" in its
+  final report. With it, the model is forced to incorporate the findings
+  before continuing.
+
+You can `tail -f /tmp/secorizon_bg_*.txt` from another terminal to watch
+the backgrounded job in real time.
+
+This usually fires on `crt.sh` JSON pulls, full-port nmap, deep `find`
+traversals, recursive `grep` over a large codebase. If you didn't want
+it backgrounded, **Ctrl+C cancels the current command** (not the shell)
+and you can ask the model to retry with a smaller scope.
+
+### Ctrl+C semantics
+
+| When you press Ctrl+C… | …it does |
+|---|---|
+| during a streaming model response | Cancels the generation; control returns to the prompt |
+| during a running shell command | Kills the command (including its process group); the model is told the command was interrupted |
+| at the prompt while typing | Clears the current input line |
+| at the prompt with no input | Does nothing |
+
+To **exit** the shell, type `/exit` (saves session history) or hit Ctrl+D
+twice on an empty prompt. The startup banner says this explicitly.
 
 ---
 
@@ -186,7 +289,30 @@ firing. Check that the model you're using outputs valid JSON — see
 The model isn't producing valid JSON. Try a bigger model, or read [custom-ai.md § "What 'good enough' means"](custom-ai.md#what-good-enough-means) for diagnosis.
 
 **Out of memory on `ollama run`**
-The quant is too large for your VRAM. Drop one tier (Q5_K_M → Q4_K_M, or 14B → 8B). Or set `OLLAMA_NUM_GPU_LAYERS` to offload some layers to CPU.
+The quant is too large for your VRAM. Drop one tier (Q5_K_M → Q4_K_M, or 14B → 8B). Or set `OLLAMA_NUM_GPU_LAYERS` to offload some layers to CPU. You can also pin a smaller context with `SECORIZON_NUM_CTX=16384 ./secorizon` — at 16K the KV cache is a few GB instead of ~12 GB at 64K.
+
+**Stats line shows `load X.Xs` on every turn**
+Another Ollama client is evicting your model between requests. Common culprit: another tool (concurrent worker, another chat shell, an editor plugin) is also using Ollama and pinning a *different* model with its own `keep_alive`. With `OLLAMA_MAX_LOADED_MODELS=2` and two models that together exceed your total VRAM, Ollama ping-pongs eviction — each turn pays 30-120s reload cost.
+
+Diagnosis:
+```bash
+ollama ps                                  # see what's loaded right now
+ss -tnp | grep 11434                       # see who's connected to Ollama
+ps -ef | grep -iE "ollama|workers|llm"     # find the other client
+```
+
+Fixes (pick one):
+- Pause the other client while running SecorizonAI.
+- Use smaller quants for both models so they fit alongside each other in total VRAM.
+- Run two Ollama instances, each pinned to a different GPU with `CUDA_VISIBLE_DEVICES`, on different ports. Point each client at its own daemon via `OLLAMA_URL`.
+
+SecorizonAI's startup banner already evicts any non-active model from VRAM — but it only runs at launch. If another client warms a new model mid-session, you'll see the load times reappear.
+
+**Stats line shows `prompt < 300 tk/s` even when the model is loaded**
+The model is split across multiple GPUs (PCIe-bound) or partially CPU-offloaded. Shrink the context with `/ctx 16k` so the model + KV cache fit on a single GPU, or pick a smaller quant.
+
+**Recon commands prompt `[dangerous]` for every `cmd 2>/dev/null`**
+Update to a build from May 2026 or later. The danger filter used to over-match on stderr redirects to `/dev/null` and on benign `bash -c` bodies (`for sub in ...; do curl ...; done`). The fix is in `chat.go`'s `dangerousRedirRe` (now allow-lists `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/tty*`, etc.) and in `checkBinDanger` (now recurses into the `-c` body instead of always flagging).
 
 **Conversion script fails on a new architecture (during quickstart Step 3b)**
 `llama.cpp` lags newly-released architectures by days-to-weeks. Check the llama.cpp issues for your model family — usually someone has a PR open.
