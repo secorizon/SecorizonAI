@@ -25,12 +25,14 @@ shape we maintain at Secorizon and ship as part of the Pro license.
 | Component | Why | Where to get it |
 |---|---|---|
 | **Go 1.25+** | Build the binary and its pinned `x/term` dependency | https://go.dev/dl/ — or your package manager |
-| **Ollama** | Serve the local LLM | https://ollama.com/download |
-| **A model** | The actual brain | `ollama pull <name>` — see [custom-ai.md](custom-ai.md) for picks |
+| **Ollama** | Serve the default local LLM; optional when using only DeepSeek | https://ollama.com/download |
+| **A model or DeepSeek API key** | The actual brain | `ollama pull <name>` or a DeepSeek API credential |
 | **Docker + Compose** | Optional, for containerized deploys | https://docs.docker.com/get-docker/ |
 | **Linux or macOS** | Tested on Ubuntu 22.04 + macOS 14 | Other Unixes likely work; Windows untested |
 
-GPU is **strongly recommended** for the LLM (CPU inference is technically possible but slow enough to be impractical). Most workstation cards (anything with 12GB+ VRAM) handle 7-13B models comfortably; larger models want 24GB+ or multi-GPU.
+GPU is **strongly recommended** for local inference (CPU inference is
+technically possible but slow enough to be impractical). Hosted DeepSeek mode
+does not use or inspect a local GPU.
 
 ---
 
@@ -108,21 +110,67 @@ SECORIZON_NUM_CTX=16384 ./secorizon               # override default context win
 You'll see the banner and prompt:
 
 ```
-  SecorizonAI v1.2 — el8 security research AI
+  SecorizonAI v1.3 — el8 security research AI
   Author: Laurent Gaffie  ·  https://secorizon.com  ·  twitter.com/secorizon
   model: secorizon:v2  │  /help for commands
   Connected. Type anything. /exit to quit.
-  GPU: <auto-detected via nvidia-smi> · <total> GB total
+  GPU: <local nvidia-smi inventory, or remote Ollama model placement>
   context: 64K tokens
 ```
 
-The GPU line is populated from `nvidia-smi` at launch — it's informational
-(used to compute placement hints on `/ctx <N>`). If you have no NVIDIA
-GPU (AMD, Apple, CPU-only), the line shows `GPU: none detected` and the
-shell still runs against whatever Ollama is using.
+When `OLLAMA_URL` is local, the GPU line is populated from `nvidia-smi` and is
+used for `/ctx <N>` placement hints. For a remote URL (for example
+`http://10.8.0.4:11434`), SecorizonAI does **not** inspect the client's GPUs.
+It reads the warm model's `size_vram` from Ollama `/api/ps` and displays its
+GPU/CPU split and model VRAM. If the model is cold at startup, the banner says
+so and placement is printed after the first response loads it. Ollama's public
+API does not expose remote GPU names, count, or total capacity, so those values
+cannot be shown or used for automatic context sizing. A local non-NVIDIA or
+CPU-only setup still shows `GPU: none detected` and remains usable.
 
 If you see "Cannot connect to Ollama" — make sure `ollama serve` is running
 and `OLLAMA_URL` (default `http://localhost:11434`) is reachable.
+
+### Optional: use DeepSeek V4 Flash
+
+Ollama remains the default. To opt into the hosted DeepSeek backend from the
+running shell:
+
+```text
+/cloudmodel deepseek deepseek-v4-flash
+# enter the API key at the masked prompt
+```
+
+If this is the first launch and no Ollama daemon is available, start once with
+`SECORIZON_MODEL_BACKEND=deepseek ./secorizon`; then run `/cloudmodel` above.
+That avoids putting the API key in shell history.
+
+The switch is persistent and clears the current conversation context. It does
+not require Ollama to be running on later launches. While DeepSeek is active,
+the system prompt, user messages, loaded guides, web-search results, and command
+output included in model context are sent to the DeepSeek API; shell commands
+still execute locally. Return persistently to the remembered Ollama model with:
+
+```text
+/localmodel
+# or choose a different installed Ollama model
+/localmodel secorizon:v3-q4km
+```
+
+Selection is stored in `~/.secorizon/model-settings.json`; the API key is kept
+separately in `~/.secorizon/cloud-credentials.json`. Both files are private
+mode 0600. For a one-process, non-persistent selection:
+
+```bash
+SECORIZON_MODEL_BACKEND=deepseek \
+SECORIZON_CLOUD_MODEL=deepseek-v4-flash \
+DEEPSEEK_API_KEY='<key>' ./secorizon
+```
+
+DeepSeek mode defaults to a 128K active harness budget within the provider's
+1M model capability. `/ctx` changes the harness budget only; `/think` controls
+DeepSeek's native thinking mode. `DEEPSEEK_BASE_URL` may override the endpoint,
+but it must be an absolute HTTPS URL.
 
 ---
 

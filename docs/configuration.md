@@ -10,15 +10,24 @@ Every knob the shell exposes — environment variables, config files, in-session
 
 ## Environment variables
 
-### Model + Ollama
+### Model backends
 
 | Variable | Default | What it does |
 |---|---|---|
 | `SECORIZON_MODEL` | `secorizon:v2` | Ollama model tag to use. Override it with any installed Ollama tag; see [custom-ai.md](custom-ai.md) for model and quantization guidance. The shell's context default is 250K, so a single 24 GB card generally wants `/fast` or an explicit `SECORIZON_NUM_CTX`. |
-| `SECORIZON_NUM_CTX` | unset (binary default `250000` / 250K) | Context window in tokens. Highest precedence: pinning this at launch overrides the binary default and the `/ctx` runtime command's starting value. Setting it ≤ 32768 also starts the shell in fast mode. |
+| `SECORIZON_NUM_CTX` | unset (local: `250000`; DeepSeek: `131072`) | Local Ollama context window or DeepSeek active harness budget. Highest precedence: pinning this at launch overrides the backend default and the `/ctx` runtime command's starting value. Setting it ≤ 32768 also starts the shell in fast mode. |
 | `SECORIZON_KEEP_ALIVE` | `24h` | Sent as the `keep_alive` field in every Ollama chat request. Defends against any client/proxy that defaults to 0 (which would unload the model after every request, paying 30-120s reload cost per turn). |
 | `OLLAMA_URL` | `http://localhost:11434` | Where to reach the Ollama HTTP API. Use `http://host.docker.internal:11434` when running in Docker against host Ollama. Useful when running two Ollama instances on different ports (one per GPU). |
 | `OLLAMA_KEEP_ALIVE` | `5m` (Ollama default) | Read by the **Ollama daemon**, not the SecorizonAI binary. The shell sends per-request `keep_alive: 24h` (see above) so this server-side default is usually redundant — but setting it to `24h` is still a good defensive measure. |
+| `SECORIZON_MODEL_BACKEND` | persisted selection, else `local` | Temporary backend override: `local` or `deepseek`. Does not rewrite the saved selection. |
+| `SECORIZON_CLOUD_MODEL` | `deepseek-v4-flash` | Temporarily selects the DeepSeek model and, unless `SECORIZON_MODEL_BACKEND` is explicit, selects the DeepSeek backend. |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek Chat Completions API base URL. Must be absolute HTTPS. |
+| `DEEPSEEK_API_KEY` | saved credential | Temporary DeepSeek credential override. It is read only into runtime memory and is never written to prompts, history, reports, or model settings. |
+
+On startup, persisted settings are the default. Explicit `SECORIZON_MODEL` or
+`OLLAMA_URL` temporarily selects local Ollama; an explicit backend/cloud-model
+variable selects DeepSeek. Environment overrides never rewrite the persisted
+selection made with `/cloudmodel` or `/localmodel`.
 
 ### Sampling
 
@@ -195,6 +204,8 @@ Created on first run. Holds per-session state:
 ├── guides/              # optional — additional guides; a system guide wins on duplicate filename
 ├── custom-guides/       # add your own guides here; loaded alongside default ones
 ├── guides.aliases       # optional — short names for /guides <name>
+├── model-settings.json  # persistent backend/model/endpoints; mode 0600
+├── cloud-credentials.json # provider API keys only; mode 0600
 ├── history/             # atomic JSONL checkpoints; `session_YYYYMMDD_HHMMSS.jsonl`
 └── input_history        # last 1000 user inputs (up-arrow recall)
 ```
@@ -209,10 +220,12 @@ Type these at the prompt:
 |---|---|
 | `/help` | Print the command list |
 | `/clear` | Reset conversation context (keeps system prompt) |
-| `/model [name\|tag]` | Show current model, or switch to a different one. Accepts an alias from the built-in map (`v2` → `secorizon:v2`, `v3` → `secorizon:v3`) **or** any raw Ollama tag (`/model llama3.1:8b`). On switch, the previous model is explicitly evicted from VRAM so the new one gets uncontested headroom — you'll see `Evicted <name> from VRAM` and the next message will trigger a one-time cold load. |
-| `/think` | Toggle Think++ mode — model uses `<think>...</think>` reasoning tags before the JSON response |
-| `/fast` | Toggle fast mode. **OFF by default** — the shell starts at the full 250K context for deep code review or AD sessions. Toggle ON for a smaller, faster context (auto-sized to your detected GPU, falling back to 16K) when you want quicker turns. Switching to a smaller context auto-unloads the current model so the new size takes effect immediately. |
-| `/ctx [N]` | Show or set the exact context window in tokens. `/ctx` (no arg) prints current. `/ctx 32k`, `/ctx 65536`, `/ctx 250000` set it explicitly. Range: 2048 – 1M. Shrinking the window auto-unloads the running model so the next message reloads at the smaller size (Ollama refuses to shrink in place). The placement hint shown after the new value (`single-GPU placement` vs `may span multiple GPUs`) is computed from your detected GPUs and the model's reported size. |
+| `/model [name\|tag]` | Show or persistently change the model on the active backend. Local mode accepts aliases (`v2`, `v3`) or raw Ollama tags and evicts the previous model; DeepSeek mode changes the cloud model name. |
+| `/cloudmodel deepseek [model]` | Persistently select DeepSeek (default `deepseek-v4-flash`) and read its API key with terminal echo disabled. A blank key keeps the saved credential. Switching clears conversation context. |
+| `/localmodel [model]` | Persistently switch back to the remembered Ollama URL/model, optionally replacing the local model. Switching clears conversation context. |
+| `/think` | Toggle Think++ mode. Ollama uses native/prompt-based reasoning as supported; DeepSeek sends its native `thinking` API control while retaining the structured JSON response. |
+| `/fast` | Toggle fast mode. Local Ollama uses GPU-aware sizing (16K fallback) when ON and 250K when OFF; shrinking unloads the local model so the new KV-cache size takes effect. DeepSeek uses a 16K/128K active harness budget without an Ollama reload. |
+| `/ctx [N]` | Show or set 2048–1M tokens. In local mode this is Ollama's exact context window; shrinking unloads the model and placement hints use detected GPU/model size. In DeepSeek mode it changes only the harness's conversation budget because runtime context is provider-controlled. |
 | `/guides [name\|all\|off]` | Load a methodology guide on-demand. Off by default for fast cold starts. `/guides` (no arg) lists what's available and what's loaded; `/guides recon` (or any alias) injects that guide into the system prompt; `/guides all` loads every guide in `guides/`; `/guides off` strips all loaded guides. See [custom-ai.md](custom-ai.md#adding-methodology-guides) for the alias system. |
 | `/burp [host[:port]]` | Enable Burp MCP (disabled by default). With no arg, connects to `BURP_MCP_URL`. With `<host>` or `<host:port>` or `http(s)://<url>`, switches to that endpoint and connects. Sub-commands: `/burp off` (disable), `/burp tools` (list discovered tools). |
 | `/bymodule <dir>` | Audit each subdirectory of `<dir>` in its own fresh context, one module at a time, so a large codebase reviews cleanly without blowing the window. Oversized modules are auto-split (and very large single files compacted) to fit `numCtx`. Findings from earlier modules accumulate in the scratchpad (see `/scratch`). |
@@ -232,7 +245,8 @@ These are hardcoded but easy to change in `chat.go` if you need to. Search for t
 |---|---|---|---|
 | Default model | `secorizon:v2` | `model = envOr("SECORIZON_MODEL", "secorizon:v2")` | Override with `SECORIZON_MODEL=<installed-tag>` or switch at runtime with `/model`. |
 | Default context | 250,000 tokens (250K) | `numCtx = 250000` (fast mode OFF) | Full-depth context for code-audit / AD-pivot sessions. Spans multiple GPUs on most setups; trade speed for capacity. Override at launch with `SECORIZON_NUM_CTX=16384`, or at runtime with `/ctx 16k`. |
-| Fast-mode context | GPU-auto-sized (16K fallback) | set when `/fast` is toggled ON (`recommendCtx(...)`, else `16384`) | Smaller window for quicker turns; sized from your detected GPU VRAM and the model's on-disk size. |
+| DeepSeek active budget | 131,072 tokens (128K) | `deepSeekPromptBudget` | Conservative active conversation budget within DeepSeek V4's provider-controlled 1M capability. `/ctx` changes the harness budget; it does not send a fictitious Ollama `num_ctx` field to DeepSeek. |
+| Fast-mode context | Local GPU-auto-sized (16K fallback) | set when `/fast` is toggled ON (`recommendCtx(...)`, else `16384`) | Smaller window for quicker turns. Local Ollama uses detected GPU capacity; remote Ollama uses 16K because `/api/ps` exposes model placement but not server GPU capacity. Override with `/ctx <N>` when you know the remote host's headroom. |
 | Per-request keep-alive | `24h` | `KeepAlive: envOr("SECORIZON_KEEP_ALIVE", "24h")` | Sent in every chat request to pin the model in VRAM across turns. Avoids the 30-120s reload cost that hits when another client (or a misconfigured Ollama default of 0) evicts the model between messages. |
 | Max autonomous steps | 500 | `maxSteps := 500` | Hard cap on how many command/search turns the agent can run before forced exit. |
 | Quiet-command background threshold | 30 s | `defaultCommandRunOptions.softTimeout` | A command with no output moves to the background. Combined stdout/stderr is already streaming to the displayed `/tmp/secorizon_bg_*.txt`; the hard timeout remains 5 minutes. |

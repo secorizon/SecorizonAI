@@ -2,9 +2,18 @@
 
 All notable changes to the SecorizonAI shell are documented here.
 
-## Unreleased
+## v1.3
 
 ### Added
+
+- **Persistent DeepSeek V4 Flash backend.** `/cloudmodel deepseek [model]`
+  opts into DeepSeek's OpenAI-compatible Chat Completions API with native
+  thinking control and JSON-object output; `/localmodel [model]` returns to
+  the remembered Ollama model. Backend selection persists separately from the
+  mode-0600 API-key store, while `SECORIZON_MODEL_BACKEND`,
+  `SECORIZON_CLOUD_MODEL`, `DEEPSEEK_BASE_URL`, and `DEEPSEEK_API_KEY` provide
+  non-persistent environment overrides. Ollama remains the default, and cloud
+  mode does not require a reachable Ollama server or local GPU.
 
 - **Report file for every completed task.** Every clean, non-conversational
   `status: done` turn now writes a private Markdown report under `~/reports`,
@@ -38,6 +47,39 @@ All notable changes to the SecorizonAI shell are documented here.
   empty-command-streak guard still bounds.
 
 ### Fixed
+
+- **Read-only shell substitutions no longer trigger false danger prompts.**
+  `$(...)`, legacy backticks, and process substitutions are now parsed and
+  recursively screened instead of being rejected by syntax alone. Safe path
+  discovery such as `MODCACHE=$(go env GOMODCACHE ...); sed ...` runs normally;
+  dangerous nested commands, malformed/deeply nested substitutions, and
+  substitutions that dynamically produce the executable name still require
+  confirmation.
+
+- **DeepSeek credentials pasted at the masked prompt.** Older sessions could
+  save literal bracketed-paste escape markers around an API key, causing Go to
+  reject the `Authorization` header before making a request. Secret input now
+  disables terminal paste envelopes, keys are normalized and header-validated,
+  and existing mode-0600 credential files are repaired automatically on the
+  next launch without exposing the key. Model-provider failures now terminate
+  the current agent turn after one attempt instead of repeating the same error
+  until the no-command watchdog fires.
+
+- **Readable, size-safe bracketed paste input.** Pasted text now renders as a
+  bordered multiline block with explicit width-aware wrapping instead of being
+  flattened into broken prompt redraws. Split paste markers are recognized
+  across arbitrary terminal reads, Unicode/control bytes are displayed safely,
+  cursor movement uses the rendered geometry, and blocks taller than the
+  terminal switch to a cursor-centered editing viewport while the complete
+  original remains readable in scrollback.
+
+- **Remote Ollama GPU reporting.** A shell connected through a non-loopback
+  `OLLAMA_URL` no longer runs client-side `nvidia-smi` and falsely reports
+  `GPU: none detected` (or, worse, reports the client's unrelated GPUs).
+  `/api/ps` now supplies the warm model's GPU/CPU split and model VRAM; cold
+  remote models report placement once after their first response. Ollama does
+  not expose remote GPU names/count/total capacity, so the banner says so
+  instead of inventing inventory, and `/fast` labels its remote 16K fallback.
 
 - **Hidden internal tool envelopes.** Tool-tuned models occasionally append a
   `<tool_call>{...}</tool_call>` control object to an otherwise complete report,

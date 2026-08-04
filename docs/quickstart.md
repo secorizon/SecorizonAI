@@ -40,6 +40,28 @@ SECORIZON_MODEL=my-agent ./secorizon
 
 If you understand each line, you're done. The rest of this doc explains the choices.
 
+### Hosted alternative: DeepSeek V4 Flash
+
+If you do not want to install or run Ollama, build SecorizonAI, start it, and
+select DeepSeek from the prompt:
+
+```bash
+go build -o secorizon ./chat.go
+SECORIZON_MODEL_BACKEND=deepseek ./secorizon
+```
+
+```text
+/cloudmodel deepseek deepseek-v4-flash
+# enter the API key at the masked prompt
+```
+
+The launch override bypasses the initial Ollama check without storing a secret
+in shell history. The masked `/cloudmodel` prompt saves the credential and
+makes the choice persistent; `/localmodel [model]` switches back to Ollama.
+Hosted mode sends the conversation and any tool results placed in model context
+to the DeepSeek API, while command execution remains on the machine running
+SecorizonAI.
+
 ---
 
 ## Step 1 — Install Ollama
@@ -227,7 +249,7 @@ echo 'export SECORIZON_MODEL=my-agent' >> ~/.bashrc
 You should see:
 
 ```
-  SecorizonAI v1.2 — el8 security research AI
+  SecorizonAI v1.3 — el8 security research AI
   Author: Laurent Gaffie  ·  https://secorizon.com  ·  twitter.com/secorizon
   model: secorizon:v2  │  /help for commands
   Connected. Type anything. /exit to quit.

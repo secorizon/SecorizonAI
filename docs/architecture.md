@@ -28,7 +28,8 @@ How the shell actually works internally. Read this if you want to extend it, deb
 └────────────────────────┬─────────────────────────────────────────┘
                          │
 ┌────────────────────────▼─────────────────────────────────────────┐
-│  ollamaChat(messages) → model returns one JSON response          │
+│  ollamaChat(messages) dispatches to Ollama or DeepSeek             │
+│  → selected model returns one JSON response                       │
 └────────────────────────┬─────────────────────────────────────────┘
                          │
 ┌────────────────────────▼─────────────────────────────────────────┐
@@ -55,12 +56,12 @@ How the shell actually works internally. Read this if you want to extend it, deb
                          │
                          ▼
                   Append to messages
-                  Loop back to ollamaChat()
+                  Loop back to selected backend
 ```
 
 ## File breakdown
 
-The runtime shell remains one file: `chat.go` (~6,100 lines), with focused
+The runtime shell remains one file: `chat.go` (~7,500 lines), with focused
 regression coverage in `chat_test.go`. Runtime sections in declaration order:
 
 Sections, in declaration order (search for each section's leading function or constant to jump to it):
@@ -68,21 +69,21 @@ Sections, in declaration order (search for each section's leading function or co
 | Section | Purpose |
 |---|---|
 | Imports + ANSI colors | Standard library + `golang.org/x/term`; color constants used everywhere. |
-| Globals | Default model, paths, mode toggles, danger filter tables, pending-bg-results queue. |
+| Globals | Backend/model selection, paths, mode toggles, danger filter tables, pending-bg-results queue. |
 | Burp MCP client (`BurpMCP`, `connect`, `sendRPC`, `discoverTools`, `callTool`, `toolsManifest`, `dispatchBurpMCP`, `normalizeBurpURL`) | Optional integration with PortSwigger Burp Suite via MCP. Opt-in via `/burp`. Implements both MCP-over-HTTP-POST and MCP-over-SSE; no MCP library dependency. |
 | Web search (`webSearch`) | DuckDuckGo HTML scrape; returns top 5 results as a text block. |
 | `technicalPrompt` | The JSON-output schema instructions appended to `SECORIZON.md` at runtime. |
-| Helpers (`envOr`, `expandHome`, `mkdirPrivate`, `sanitizeForTerminal`, etc.) | Small utility functions used throughout. |
+| Helpers + model settings (`envOr`, `expandHome`, `mkdirPrivate`, `applyPersistentModelSelection`, etc.) | Small utility functions plus private, persistent local/cloud selection and credential storage. |
 | Config loader (`loadSystemPrompt`) | Resolves `SECORIZON.md` path (env override → system-wide → per-user) and reads it. |
 | History (`saveHistory`, `loadInputHistory`, `saveInputHistory`) | Session transcript + arrow-up input recall. |
 | Raw-mode reader (`readLine`, `readLineRaw`, `readLineCooked`) | Terminal input with paste support, prompt redraw, bracketed-paste, Ctrl+D handling. |
-| Ollama client (`chatRequest`, `chatResponse`, `ollamaChat`, `unloadOllamaModel`, `listLoadedModels`, `modelDiskSizeMB`, `modelSupportsThinking`) | All HTTP traffic to Ollama. The per-request `keep_alive` lives here. |
-| GPU detection (`detectGPUs`, `recommendCtx`, `snapCtx`) | Shells out to `nvidia-smi` once at startup and computes a sensible default context window. |
+| Model clients (`deepSeekChat`, `ollamaChat`, `chatRequest`, `chatResponse`) | `ollamaChat` is the backend dispatcher. Local requests stream through Ollama; DeepSeek requests use its OpenAI-compatible Chat Completions endpoint with native thinking and JSON-object mode. |
+| GPU detection (`detectGPUs`, `listLoadedModelInfo`, `recommendCtx`, `snapCtx`) | Local Ollama: shells out to `nvidia-smi` once. Remote Ollama: reads the loaded model's GPU/CPU split and model VRAM from `/api/ps`; remote GPU inventory is not exposed by Ollama. |
 | Network checks (`networkFailureReason`, `checkNetworkUp`) | Distinguishes "the internet is down" from "this one target is broken". |
 | Danger filters (`dangerousBins`, `dangerousSubstrings`, `dangerousRedirRe`, `safeRedirTargets`, `extractShellCBody`, `checkBinDanger`, `isDangerous`) | Pre-execution command screening (see "Command execution" below). |
 | Command runner (`runCommand`) | Spawns `bash -c`, captures output, applies timeouts, queues background results for the next model turn via `drainPendingBgResults`. |
 | Banner + `/help` (`printBanner`, `printHelp`) | The ASCII-art startup graphic + the `/help` slash-command screen. |
-| `main()` | Initialization (`detectGPUs`, evict-stale-models, load `SECORIZON.md`, discover guides), then the user-input + agent-step dispatch loop. |
+| `main()` | Applies persistent backend selection, initializes Ollama/GPU state only for local mode, loads `SECORIZON.md` and guides, then enters the user-input + agent-step dispatch loop. |
 
 ## The chat loop in detail
 
@@ -167,7 +168,9 @@ type ModelResponse struct {
 2. **JSON wrapped in `<think>...</think>` tags.** Strips the thinking and parses the rest.
 3. **Malformed/truncated JSON.** Best-effort string extraction of the `text` field; sets `parseError` and forces `Status: "continue"` so the loop re-prompts.
 
-The `format: json` enforcement in the Ollama request (`"format": "json"` in chatRequest) tells the model to constrain its output. Modern models honor this well; older or smaller ones may ignore it.
+The selected provider constrains this envelope. Ollama receives `"format":
+"json"`; DeepSeek receives `"response_format":{"type":"json_object"}`.
+Modern models honor this well; older or smaller local models may ignore it.
 
 ## Command execution
 
@@ -217,6 +220,40 @@ Breakdown:
 - `load X.Xs` — **only printed when > 1s**. If you see it on every turn, the model is being evicted between requests (another client, missing `keep_alive`, or VRAM contention). Each load means a 30-120s reload of the full weights from disk.
 - `total Xs` — wall-clock duration.
 
+DeepSeek reports provider token accounting instead of local throughput:
+
+```
+[deepseek-v4-flash] 5.8k tokens | prompt 5200 | gen 600 | 9.4s total
+```
+
+There is no Ollama load time, GPU placement, or local tokens-per-second value
+for a hosted response.
+
+## Model backends and trust boundary
+
+Ollama is the default backend. `/cloudmodel deepseek [model]` is an explicit,
+persistent opt-in to DeepSeek; `/localmodel [model]` switches persistently back
+to the remembered Ollama server and model. Environment variables can override
+the saved selection for one process without rewriting it.
+
+DeepSeek uses `POST <base-url>/chat/completions`, Bearer authentication,
+provider-native thinking control, JSON-object response mode, and a bounded
+non-streaming response body. The same `ModelResponse` envelope drives the
+existing command/search loop, so command execution remains local. The trust
+boundary does change: every message sent as model context—including system
+prompt text, user prompts, command output, web-search results, and loaded
+guides—is transmitted to DeepSeek while that backend is active. The API key is
+never included in the request body, terminal echo is disabled while it is
+entered, and provider error text is bounded and redacted before display.
+
+Selection and credentials are deliberately separate:
+
+- `~/.secorizon/model-settings.json` stores backend, model, and endpoint.
+- `~/.secorizon/cloud-credentials.json` stores the API key.
+
+Both are written atomically with mode 0600. `DEEPSEEK_BASE_URL` must be an
+absolute HTTPS URL.
+
 ## Web search
 
 `webSearch()` (around line 295) does DuckDuckGo HTML scraping:
@@ -252,32 +289,40 @@ The MCP client lives in chat.go around lines 115–340 (the `BurpMCP` struct, `c
 
 1. Calls `term.MakeRaw(fd)` to disable line buffering and echo.
 2. Enables bracketed paste mode by writing `\033[?2004h` to stdout.
-3. Reads bytes from stdin, decoding UTF-8 runes.
-4. Tracks cursor position, manages a `[]rune` line buffer.
+3. Reads bytes from stdin through a streaming bracketed-paste parser, so the
+   opening and closing markers remain reliable even when split across reads.
+4. Tracks the untouched logical `[]rune` input separately from a safe terminal
+   rendering. Pasted input is displayed as a bordered multiline block with
+   explicit soft wraps, Unicode cell widths, visible control pictures, and
+   aligned continuation rows.
 5. Recognizes:
    - Bracketed paste markers (`\033[200~...\033[201~`) — accumulates until closer, inserts as one chunk.
    - Arrow keys (`\033[A` up, `\033[B` down) — for history nav.
    - Cursor moves (`\033[C` right, `\033[D` left, Home/End).
    - Backspace, Ctrl-A, Ctrl-E, Ctrl-K, Ctrl-U, Ctrl-L (clear screen).
    - Ctrl-C (cancel current line), Ctrl-D (EOF on empty).
-6. Restores terminal state on return via `defer term.Restore()`.
+6. Uses a cursor-centered viewport for edits when a paste is taller than the
+   terminal; the initial complete block remains available in scrollback.
+7. Restores terminal state on return via `defer term.Restore()`.
 
 This is why the binary doesn't need `rlwrap` — it handles all the line-editing concerns itself, and rlwrap would actually break the multi-line paste handling.
 
 ## Mode toggles
 
-Three flags affect model invocation:
+The following state affects model invocation:
 
 | Flag | Effect | Set by |
 |---|---|---|
-| `thinkMode` | Adds "use `<think>...</think>` tags" to the system reminder; sets `chatRequest.Think = &true` for native think-mode on supported models | `/think` |
-| `fastMode` + `numCtx` | Default `numCtx = 250000` (250K) with `fastMode = false` — full depth out of the box. `/fast` toggles ON to a smaller, faster context (GPU-auto-sized via `recommendCtx`, else 16K). `/ctx <N>` sets an explicit value. Shrinking the window auto-calls `unloadOllamaModel(model)` so the next request reloads with the smaller KV cache — Ollama refuses to shrink a loaded instance. Placement hint after the new value is computed from `gpus.minMB` vs `modelMB + (numCtx * 200)/1024`. | `/fast`, `/ctx <N>`, `SECORIZON_NUM_CTX` |
-| `gpus` (GPU info) | Populated once at startup by `detectGPUs()` shelling out to `nvidia-smi --query-gpu=name,memory.total`. Used for the banner line and for the `/ctx`/`/fast` placement hint. Zero-value when no NVIDIA GPUs present — the binary stays usable on AMD / Apple / CPU-only setups; placement hints just disappear. | banner display |
+| `modelBackend` | Selects local Ollama or hosted DeepSeek. The selection persists unless temporarily overridden by environment variables. | `/cloudmodel`, `/localmodel`, `SECORIZON_MODEL_BACKEND` |
+| `thinkMode` | Enables provider-native thinking (`chatRequest.Think` for supported Ollama models; `thinking.type=enabled` for DeepSeek). The local-only reminder suffix is not sent to DeepSeek. | `/think` |
+| `fastMode` + `numCtx` | Local default is 250K; `/fast` uses GPU-aware sizing or 16K and `/ctx` controls Ollama `num_ctx`. DeepSeek defaults to a conservative 128K active harness budget within its provider-controlled 1M capability; `/ctx` changes only that harness budget and `/fast` toggles 16K/128K. Ollama unload/reload and placement hints apply only to local mode. | `/fast`, `/ctx <N>`, `SECORIZON_NUM_CTX` |
+| `gpus` (GPU info) | When `OLLAMA_URL` is local, populated once by `detectGPUs()` using `nvidia-smi --query-gpu=name,memory.total` and used for `/ctx`/`/fast` placement hints. For a non-loopback Ollama URL, client-side GPU probing is deliberately skipped: `/api/ps` reports the loaded model's `size`/`size_vram` GPU/CPU split, at startup if warm or after the first response if cold. Ollama does not expose remote GPU names, count, or total VRAM, so remote capacity-based auto-sizing is not attempted. | banner display, post-load placement line |
 | `keep_alive` (per request) | Sent in every `/api/chat` payload as `KeepAlive: envOr("SECORIZON_KEEP_ALIVE", "24h")`. Pins the model in VRAM across turns, defending against any Ollama client/proxy chain that defaults the field to 0. | `SECORIZON_KEEP_ALIVE` |
 | Startup model eviction | `listLoadedModels()` is called in `main()` after greeting; any model that isn't `model` (the active selection) is unloaded with `keep_alive=0`. Prevents ping-pong eviction with other Ollama clients (e.g. concurrent SecInvest workers) that share the same daemon. | automatic; banner prints `evicted stale model from VRAM: <name>` |
 | `guidesEnabled` + `guidesLoaded` | Tracks which `guides/*.md` files have been opt-in injected into the system prompt. Off by default for fast cold start; user loads per-task via `/guides <name>`. The system prompt is rebuilt cleanly from `originalSystemPrompt` + currently-loaded guides on every change. | `/guides`, `/guides <name>`, `/guides all`, `/guides off` |
 
-These are simple booleans modified in slash-command handlers and read in `ollamaChat()`.
+These values are modified in slash-command handlers and consumed by the
+selected model client through `ollamaChat()`.
 
 ## Session history
 
@@ -291,6 +336,9 @@ User input history (the up-arrow buffer in the prompt) is persisted to
 `~/.secorizon/input_history` separately and IS loaded back on launch, so
 recent commands stay reachable across sessions.
 
+Backend selection and cloud credentials live beside that history in separate
+private JSON files; they are configuration state, not part of session replay.
+
 ## Where to extend
 
 If you want to add new capabilities, here's where to look:
@@ -299,7 +347,7 @@ If you want to add new capabilities, here's where to look:
 |---|---|
 | New slash command | The big switch in main() around line 1840+ |
 | New tool (besides command + search) | New field in ModelResponse + handler in the task loop |
-| Different LLM API (vs Ollama) | Replace `ollamaChat()` and `chatRequest` types |
+| Additional LLM provider | Add a provider client beside `deepSeekChat()` and dispatch to it from `ollamaChat()`; extend persistent provider validation and slash commands |
 | Different web search | Replace `webSearch()` |
 | New filesystem locations | `loadConfig()` and `loadGuides()` |
 | Custom command filters | `dangerousBins`, `dangerousSubstrings`, `isDangerous()` |

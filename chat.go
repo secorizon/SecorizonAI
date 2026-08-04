@@ -32,6 +32,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/term"
@@ -47,6 +48,14 @@ const (
 	cGreen  = "\033[92m"
 	cYellow = "\033[93m"
 	cCyan   = "\033[96m"
+
+	localModelBackend      = "local"
+	deepSeekProvider       = "deepseek"
+	deepSeekDefaultBaseURL = "https://api.deepseek.com"
+	deepSeekDefaultModel   = "deepseek-v4-flash"
+	deepSeekContextTokens  = 1_000_000
+	deepSeekPromptBudget   = 131_072
+	modelSettingsVersion   = 1
 )
 
 // ── Globals ─────────────────────────────────────────────────────────────────
@@ -60,8 +69,16 @@ var (
 		"v2": "secorizon:v2",
 		"v3": "secorizon:v3",
 	}
-	thinkMode = false
-	fastMode  = false // default: full 250K context. /fast for a smaller, faster ctx.
+	modelBackend       = localModelBackend
+	localModel         = model
+	localOllamaURL     = ollamaURL
+	cloudProvider      = deepSeekProvider
+	cloudModel         = deepSeekDefaultModel
+	cloudBaseURL       = deepSeekDefaultBaseURL
+	cloudAPIKey        string
+	deepSeekHTTPClient = &http.Client{Timeout: 15 * time.Minute}
+	thinkMode          = false
+	fastMode           = false // default: full 250K context. /fast for a smaller, faster ctx.
 	// 250K default gives deep multi-file audits room; /fast or SECORIZON_NUM_CTX lowers it.
 	numCtx               = 250000
 	moduleQueue          []auditUnit           // /bymodule: queued audit units, fresh context each (oversized modules auto-split)
@@ -219,11 +236,6 @@ var (
 	// Newlines are command separators in bash just like semicolons. Omitting
 	// them let a harmless first line hide a destructive second command.
 	segmentSplitter = regexp.MustCompile(`;|&&|\|\||\||&|\r?\n`)
-
-	// Shell substitutions execute nested command text outside the simple
-	// top-level segment/token walk. Confirm them rather than pretending the
-	// heuristic can safely interpret arbitrary shell grammar.
-	indirectShellSyntaxRe = regexp.MustCompile("`|\\$\\(|[<>]\\(")
 
 	cdRe = regexp.MustCompile(`^cd\s+(.+?)(?:\s*&&\s*(.+))?$`)
 
@@ -411,7 +423,7 @@ func (b *BurpMCP) connect() bool {
 	if _, err := b.sendRPC("initialize", map[string]interface{}{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]interface{}{},
-		"clientInfo":      map[string]string{"name": "SecorizonAI", "version": "1.2"},
+		"clientInfo":      map[string]string{"name": "SecorizonAI", "version": "1.3"},
 	}, b.nextRPCID()); err != nil {
 		b.disconnect()
 		return false
@@ -1900,6 +1912,319 @@ func expandHome(p string) string {
 // include credentials.
 func mkdirPrivate(p string) { os.MkdirAll(p, 0700) }
 
+type persistedModelSettings struct {
+	Version       int    `json:"version"`
+	Backend       string `json:"backend"`
+	LocalModel    string `json:"local_model,omitempty"`
+	OllamaURL     string `json:"ollama_url,omitempty"`
+	CloudProvider string `json:"cloud_provider,omitempty"`
+	CloudModel    string `json:"cloud_model,omitempty"`
+	CloudBaseURL  string `json:"cloud_base_url,omitempty"`
+}
+
+type persistedCloudCredentials struct {
+	Version int               `json:"version"`
+	APIKeys map[string]string `json:"api_keys"`
+}
+
+func modelStateDir() string {
+	if dir := strings.TrimSpace(os.Getenv("SECORIZON_CONFIG_DIR")); dir != "" {
+		return dir
+	}
+	return expandHome("~/.secorizon")
+}
+
+func modelSettingsPath() string {
+	return filepath.Join(modelStateDir(), "model-settings.json")
+}
+
+func cloudCredentialsPath() string {
+	return filepath.Join(modelStateDir(), "cloud-credentials.json")
+}
+
+func normalizePersistedModelSettings(settings persistedModelSettings) (persistedModelSettings, error) {
+	settings.Backend = strings.ToLower(strings.TrimSpace(settings.Backend))
+	settings.LocalModel = strings.TrimSpace(settings.LocalModel)
+	settings.OllamaURL = strings.TrimRight(strings.TrimSpace(settings.OllamaURL), "/")
+	settings.CloudProvider = strings.ToLower(strings.TrimSpace(settings.CloudProvider))
+	settings.CloudModel = strings.TrimSpace(settings.CloudModel)
+	settings.CloudBaseURL = strings.TrimRight(strings.TrimSpace(settings.CloudBaseURL), "/")
+	if settings.Backend == "" {
+		settings.Backend = localModelBackend
+	}
+	if settings.LocalModel == "" {
+		settings.LocalModel = "secorizon:v2"
+	}
+	if settings.OllamaURL == "" {
+		settings.OllamaURL = "http://localhost:11434"
+	}
+	if settings.CloudProvider == "" {
+		settings.CloudProvider = deepSeekProvider
+	}
+	if settings.CloudModel == "" {
+		settings.CloudModel = deepSeekDefaultModel
+	}
+	if settings.CloudBaseURL == "" {
+		settings.CloudBaseURL = deepSeekDefaultBaseURL
+	}
+	if settings.Backend != localModelBackend && settings.Backend != deepSeekProvider {
+		return persistedModelSettings{}, fmt.Errorf("unsupported model backend %q", settings.Backend)
+	}
+	if settings.CloudProvider != deepSeekProvider {
+		return persistedModelSettings{}, fmt.Errorf("unsupported cloud provider %q", settings.CloudProvider)
+	}
+	if err := validateDeepSeekEndpoint(settings.CloudBaseURL); err != nil {
+		return persistedModelSettings{}, err
+	}
+	settings.Version = modelSettingsVersion
+	return settings, nil
+}
+
+func loadPersistedModelSettings() (persistedModelSettings, error) {
+	content, err := os.ReadFile(modelSettingsPath())
+	if os.IsNotExist(err) {
+		return persistedModelSettings{}, nil
+	}
+	if err != nil {
+		return persistedModelSettings{}, err
+	}
+	var settings persistedModelSettings
+	if err := json.Unmarshal(content, &settings); err != nil {
+		return persistedModelSettings{}, fmt.Errorf("decode model settings: %w", err)
+	}
+	if settings.Version != modelSettingsVersion {
+		return persistedModelSettings{}, fmt.Errorf("unsupported model settings version %d", settings.Version)
+	}
+	return normalizePersistedModelSettings(settings)
+}
+
+func savePersistedModelSettings(settings persistedModelSettings) error {
+	normalized, err := normalizePersistedModelSettings(settings)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.MarshalIndent(normalized, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode model settings: %w", err)
+	}
+	return atomicWriteFile(modelSettingsPath(), encoded, 0o600)
+}
+
+func loadCloudCredentials() (persistedCloudCredentials, error) {
+	credentials := persistedCloudCredentials{Version: modelSettingsVersion, APIKeys: map[string]string{}}
+	content, err := os.ReadFile(cloudCredentialsPath())
+	if os.IsNotExist(err) {
+		return credentials, nil
+	}
+	if err != nil {
+		return credentials, err
+	}
+	if err := json.Unmarshal(content, &credentials); err != nil {
+		return credentials, fmt.Errorf("decode cloud credentials: %w", err)
+	}
+	if credentials.Version != modelSettingsVersion {
+		return credentials, fmt.Errorf("unsupported cloud credentials version %d", credentials.Version)
+	}
+	if credentials.APIKeys == nil {
+		credentials.APIKeys = map[string]string{}
+	}
+	return credentials, nil
+}
+
+func loadCloudAPIKey(provider string) (string, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return "", fmt.Errorf("cloud provider is required")
+	}
+	credentials, err := loadCloudCredentials()
+	if err != nil {
+		return "", err
+	}
+	apiKey := credentials.APIKeys[provider]
+	if apiKey == "" {
+		return "", nil
+	}
+	normalized, changed, err := normalizeCloudAPIKey(apiKey)
+	if err != nil {
+		return "", fmt.Errorf("invalid %s API key: %w", provider, err)
+	}
+	if changed {
+		credentials.APIKeys[provider] = normalized
+		if err := writeCloudCredentials(credentials); err != nil {
+			return "", fmt.Errorf("repair %s API key storage: %w", provider, err)
+		}
+	}
+	return normalized, nil
+}
+
+func writeCloudCredentials(credentials persistedCloudCredentials) error {
+	credentials.Version = modelSettingsVersion
+	if credentials.APIKeys == nil {
+		credentials.APIKeys = map[string]string{}
+	}
+	encoded, err := json.MarshalIndent(credentials, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode cloud credentials: %w", err)
+	}
+	return atomicWriteFile(cloudCredentialsPath(), encoded, 0o600)
+}
+
+// normalizeCloudAPIKey removes terminal transport artifacts without ever
+// logging the credential. term.ReadPassword receives bracketed-paste markers
+// literally when the terminal still has paste mode enabled; those ESC bytes
+// make net/http reject Authorization before a request is sent. API credentials
+// are header tokens, so whitespace/control characters are never meaningful.
+func normalizeCloudAPIKey(raw string) (normalized string, changed bool, err error) {
+	cleaned := strings.ReplaceAll(raw, string(bracketedPasteStart), "")
+	cleaned = strings.ReplaceAll(cleaned, string(bracketedPasteEnd), "")
+	if cleaned != raw {
+		changed = true
+	}
+	trimmed := strings.TrimSpace(cleaned)
+	if trimmed != cleaned {
+		changed = true
+	}
+	var out strings.Builder
+	out.Grow(len(trimmed))
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			changed = true
+			continue
+		}
+		if r < 0x21 || r > 0x7e {
+			return "", changed, fmt.Errorf("must contain printable ASCII characters only")
+		}
+		out.WriteRune(r)
+	}
+	normalized = out.String()
+	if normalized == "" {
+		return "", changed, fmt.Errorf("cloud API key is required")
+	}
+	return normalized, changed, nil
+}
+
+func saveCloudAPIKey(provider, apiKey string) error {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider != deepSeekProvider {
+		return fmt.Errorf("unsupported cloud provider %q", provider)
+	}
+	normalized, _, err := normalizeCloudAPIKey(apiKey)
+	if err != nil {
+		return err
+	}
+	credentials, err := loadCloudCredentials()
+	if err != nil {
+		return err
+	}
+	credentials.APIKeys[provider] = normalized
+	return writeCloudCredentials(credentials)
+}
+
+func validateDeepSeekEndpoint(baseURL string) error {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("DeepSeek base URL must be an absolute HTTPS URL")
+	}
+	return nil
+}
+
+func persistCurrentModelSelection() error {
+	return savePersistedModelSettings(persistedModelSettings{
+		Backend: modelBackend, LocalModel: localModel, OllamaURL: localOllamaURL,
+		CloudProvider: cloudProvider, CloudModel: cloudModel, CloudBaseURL: cloudBaseURL,
+	})
+}
+
+// applyPersistentModelSelection mirrors the newer harness's precedence rules:
+// persisted settings are the default; an explicit local model/Ollama URL
+// temporarily selects local inference; explicit backend/cloud variables select
+// DeepSeek without rewriting the persisted choice.
+func applyPersistentModelSelection() error {
+	settings, err := loadPersistedModelSettings()
+	if err != nil {
+		return fmt.Errorf("load persistent model selection: %w", err)
+	}
+
+	localModel = model
+	localOllamaURL = ollamaURL
+	modelBackend = localModelBackend
+	cloudProvider = deepSeekProvider
+	cloudModel = deepSeekDefaultModel
+	cloudBaseURL = deepSeekDefaultBaseURL
+	if settings.Version != 0 {
+		modelBackend = settings.Backend
+		localModel, localOllamaURL = settings.LocalModel, settings.OllamaURL
+		cloudProvider, cloudModel, cloudBaseURL = settings.CloudProvider, settings.CloudModel, settings.CloudBaseURL
+	}
+
+	backendOverride := strings.ToLower(strings.TrimSpace(os.Getenv("SECORIZON_MODEL_BACKEND")))
+	localModelOverride := strings.TrimSpace(os.Getenv("SECORIZON_MODEL")) != ""
+	localURLOverride := strings.TrimSpace(os.Getenv("OLLAMA_URL")) != ""
+	if localModelOverride {
+		localModel = strings.TrimSpace(os.Getenv("SECORIZON_MODEL"))
+	}
+	if localURLOverride {
+		localOllamaURL = strings.TrimRight(strings.TrimSpace(os.Getenv("OLLAMA_URL")), "/")
+	}
+	if backendOverride != "" {
+		modelBackend = backendOverride
+	} else if localModelOverride || localURLOverride {
+		modelBackend = localModelBackend
+	}
+	if value := strings.TrimSpace(os.Getenv("SECORIZON_CLOUD_MODEL")); value != "" {
+		cloudModel = value
+		if backendOverride == "" {
+			modelBackend = deepSeekProvider
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("DEEPSEEK_BASE_URL")); value != "" {
+		cloudBaseURL = strings.TrimRight(value, "/")
+	}
+	if modelBackend != localModelBackend && modelBackend != deepSeekProvider {
+		return fmt.Errorf("model backend must be local or deepseek, got %q", modelBackend)
+	}
+	if cloudProvider != deepSeekProvider {
+		return fmt.Errorf("unsupported cloud provider %q", cloudProvider)
+	}
+	if err := validateDeepSeekEndpoint(cloudBaseURL); err != nil {
+		return err
+	}
+	cloudAPIKey = os.Getenv("DEEPSEEK_API_KEY")
+	if strings.TrimSpace(cloudAPIKey) == "" {
+		cloudAPIKey, err = loadCloudAPIKey(deepSeekProvider)
+		if err != nil {
+			return fmt.Errorf("load DeepSeek credential: %w", err)
+		}
+	} else {
+		cloudAPIKey, _, err = normalizeCloudAPIKey(cloudAPIKey)
+		if err != nil {
+			return fmt.Errorf("invalid DEEPSEEK_API_KEY: %w", err)
+		}
+	}
+	ollamaURL = localOllamaURL
+	if modelBackend == deepSeekProvider {
+		model = cloudModel
+	} else {
+		model = localModel
+	}
+	return nil
+}
+
+func readSecret(prompt string) (string, error) {
+	fmt.Print(prompt)
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		// ReadPassword does not parse bracketed-paste envelopes. Ensure the
+		// terminal sends only the secret bytes, even if a previous reader or
+		// parent shell left paste mode enabled.
+		fmt.Print("\033[?2004l")
+		secret, err := term.ReadPassword(fd)
+		fmt.Println()
+		return string(secret), err
+	}
+	return readLineCooked("", false)
+}
+
 // ── Config & Memory ─────────────────────────────────────────────────────────
 
 func loadConfig() string {
@@ -2165,6 +2490,308 @@ func visibleLen(s string) int {
 	return len([]rune(ansiCSIRe.ReplaceAllString(s, "")))
 }
 
+type editableInputDisplay struct {
+	text                 string
+	cursorRow, cursorCol int
+	endRow, endCol       int
+}
+
+// editableRuneWidth is a compact wcwidth implementation for terminal input.
+// It covers combining marks, CJK/full-width characters, and the common emoji
+// planes without adding another runtime dependency to the single-file shell.
+func editableRuneWidth(r rune) int {
+	if r == '\u200d' || r == '\ufe0e' || r == '\ufe0f' || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
+		return 0
+	}
+	if r >= 0x1100 && (r <= 0x115f ||
+		r == 0x2329 || r == 0x232a ||
+		(r >= 0x2e80 && r <= 0xa4cf && r != 0x303f) ||
+		(r >= 0xac00 && r <= 0xd7a3) ||
+		(r >= 0xf900 && r <= 0xfaff) ||
+		(r >= 0xfe10 && r <= 0xfe19) ||
+		(r >= 0xfe30 && r <= 0xfe6f) ||
+		(r >= 0xff00 && r <= 0xff60) ||
+		(r >= 0xffe0 && r <= 0xffe6) ||
+		(r >= 0x1f300 && r <= 0x1faff) ||
+		(r >= 0x20000 && r <= 0x3fffd)) {
+		return 2
+	}
+	return 1
+}
+
+func editableRuneText(r rune) (string, int) {
+	switch {
+	case r >= 0 && r <= 0x1f:
+		return string(rune(0x2400) + r), 1
+	case r == 0x7f:
+		return "␡", 1
+	case unicode.IsControl(r):
+		return "�", 1
+	default:
+		return string(r), editableRuneWidth(r)
+	}
+}
+
+func truncateInputLabel(label string, cells int) string {
+	if cells <= 0 {
+		return ""
+	}
+	rs := []rune(label)
+	if len(rs) <= cells {
+		return label
+	}
+	if cells == 1 {
+		return "…"
+	}
+	return string(rs[:cells-1]) + "…"
+}
+
+// renderEditableInput converts the logical input buffer into an explicit
+// terminal layout. Newlines and soft wraps receive an aligned continuation
+// prefix instead of relying on the terminal's implicit wrapping. Bracketed
+// paste is shown inside a visible block, while the returned value remains the
+// original, unformatted text.
+func renderEditableInput(prompt string, line []rune, cursor, termWidth int, pastedBlock bool) editableInputDisplay {
+	if termWidth < 12 {
+		termWidth = 12
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(line) {
+		cursor = len(line)
+	}
+	promptCells := visibleLen(prompt)
+	pastedBlock = pastedBlock && len(line) > 0
+
+	var out strings.Builder
+	out.Grow(len(prompt) + len(line)*2 + 128)
+	row, col := 0, 0
+	contentIndent := promptCells
+	contentPrefixCells := promptCells
+
+	if pastedBlock {
+		lineCount := 1
+		for _, r := range line {
+			if r == '\n' || r == '\r' {
+				lineCount++
+			}
+		}
+		label := fmt.Sprintf("┌─ pasted input · %d lines · %d chars", lineCount, len(line))
+		label = truncateInputLabel(label, max(1, termWidth-promptCells-1))
+		out.WriteString(prompt)
+		out.WriteString(cDim)
+		out.WriteString(label)
+		out.WriteString(cReset)
+		out.WriteString("\r\n")
+		row++
+		contentIndent = min(promptCells, max(0, termWidth-4))
+		out.WriteString(strings.Repeat(" ", contentIndent))
+		out.WriteString(cDim + "│ " + cReset)
+		contentPrefixCells = contentIndent + 2
+		col = contentPrefixCells
+	} else {
+		out.WriteString(prompt)
+		col = promptCells
+	}
+
+	lineLimit := termWidth - 1 // keep the terminal out of delayed-wrap state
+	if lineLimit <= contentPrefixCells {
+		lineLimit = contentPrefixCells + 1
+	}
+	writeContinuation := func() {
+		out.WriteString("\r\n")
+		row++
+		if pastedBlock {
+			out.WriteString(strings.Repeat(" ", contentIndent))
+			out.WriteString(cDim + "│ " + cReset)
+			col = contentPrefixCells
+		} else {
+			out.WriteString(strings.Repeat(" ", promptCells))
+			col = promptCells
+		}
+	}
+
+	cursorSet := false
+	setCursor := func(index int) {
+		if !cursorSet && index == cursor {
+			cursorSet = true
+		}
+	}
+	var cursorRow, cursorCol int
+	for i, r := range line {
+		setCursor(i)
+		if cursorSet && cursorRow == 0 && cursorCol == 0 && i == cursor {
+			cursorRow, cursorCol = row, col
+		}
+		if r == '\n' || r == '\r' {
+			writeContinuation()
+			continue
+		}
+		if r == '\t' {
+			spaces := 8 - (col % 8)
+			for j := 0; j < spaces; j++ {
+				if col+1 > lineLimit {
+					writeContinuation()
+				}
+				out.WriteByte(' ')
+				col++
+			}
+			continue
+		}
+		text, cells := editableRuneText(r)
+		if cells > 0 && col+cells > lineLimit {
+			writeContinuation()
+		}
+		out.WriteString(text)
+		col += cells
+	}
+	if cursor == len(line) {
+		cursorRow, cursorCol = row, col
+		cursorSet = true
+	}
+	if !cursorSet {
+		cursorRow, cursorCol = row, col
+	}
+
+	if pastedBlock {
+		out.WriteString("\r\n")
+		row++
+		out.WriteString(strings.Repeat(" ", contentIndent))
+		out.WriteString(cDim + "└─" + cReset)
+		col = contentIndent + 2
+	}
+	return editableInputDisplay{
+		text: out.String(), cursorRow: cursorRow, cursorCol: cursorCol,
+		endRow: row, endCol: col,
+	}
+}
+
+// viewportEditableInput keeps later edits usable when a pasted block is taller
+// than the terminal. The initial paste is printed in full (and remains readable
+// in scrollback); subsequent redraws show a cursor-centered window instead of
+// trying to cursor-up into rows that have already scrolled off-screen.
+func viewportEditableInput(full editableInputDisplay, termHeight int) editableInputDisplay {
+	if termHeight < 5 || full.endRow+1 <= termHeight {
+		return full
+	}
+	rows := strings.Split(full.text, "\r\n")
+	if len(rows) <= termHeight {
+		return full
+	}
+	contentRows := max(1, termHeight-2)
+	start := full.cursorRow - contentRows/2
+	if start < 0 {
+		start = 0
+	}
+	if start+contentRows > len(rows) {
+		start = max(0, len(rows)-contentRows)
+	}
+	end := min(len(rows), start+contentRows)
+
+	view := make([]string, 0, termHeight)
+	topRows := 0
+	if start > 0 {
+		view = append(view, fmt.Sprintf("%s… %d rows above …%s", cDim, start, cReset))
+		topRows = 1
+	}
+	view = append(view, rows[start:end]...)
+	if end < len(rows) {
+		view = append(view, fmt.Sprintf("%s… %d rows below …%s", cDim, len(rows)-end, cReset))
+	}
+	cursorRow := full.cursorRow - start + topRows
+	if cursorRow < 0 {
+		cursorRow = 0
+	}
+	if cursorRow >= len(view) {
+		cursorRow = len(view) - 1
+	}
+	last := view[len(view)-1]
+	return editableInputDisplay{
+		text: strings.Join(view, "\r\n"), cursorRow: cursorRow, cursorCol: full.cursorCol,
+		endRow: len(view) - 1, endCol: visibleLen(last),
+	}
+}
+
+var (
+	bracketedPasteStart = []byte("\x1b[200~")
+	bracketedPasteEnd   = []byte("\x1b[201~")
+)
+
+type terminalInputEvent struct {
+	pasted bool
+	data   []byte
+}
+
+type bracketedPasteStream struct {
+	pending []byte
+	paste   bytes.Buffer
+	inPaste bool
+}
+
+func markerSuffixLen(data, marker []byte) int {
+	limit := min(len(data), len(marker)-1)
+	for n := limit; n > 0; n-- {
+		if bytes.Equal(data[len(data)-n:], marker[:n]) {
+			return n
+		}
+	}
+	return 0
+}
+
+func appendTerminalInputEvent(events []terminalInputEvent, pasted bool, data []byte) []terminalInputEvent {
+	if len(data) == 0 && !pasted {
+		return events
+	}
+	copyData := append([]byte(nil), data...)
+	if len(events) > 0 && events[len(events)-1].pasted == pasted && !pasted {
+		events[len(events)-1].data = append(events[len(events)-1].data, copyData...)
+		return events
+	}
+	return append(events, terminalInputEvent{pasted: pasted, data: copyData})
+}
+
+// feed recognizes bracketed-paste boundaries even when either escape marker
+// is split across arbitrary terminal reads (common with large pastes).
+func (s *bracketedPasteStream) feed(chunk []byte) []terminalInputEvent {
+	s.pending = append(s.pending, chunk...)
+	var events []terminalInputEvent
+	for len(s.pending) > 0 {
+		marker := bracketedPasteStart
+		if s.inPaste {
+			marker = bracketedPasteEnd
+		}
+		if index := bytes.Index(s.pending, marker); index >= 0 {
+			before := s.pending[:index]
+			if s.inPaste {
+				s.paste.Write(before)
+			} else {
+				events = appendTerminalInputEvent(events, false, before)
+			}
+			s.pending = append([]byte(nil), s.pending[index+len(marker):]...)
+			if s.inPaste {
+				events = appendTerminalInputEvent(events, true, s.paste.Bytes())
+				s.paste.Reset()
+				s.inPaste = false
+			} else {
+				s.inPaste = true
+			}
+			continue
+		}
+
+		keep := markerSuffixLen(s.pending, marker)
+		ready := s.pending[:len(s.pending)-keep]
+		if s.inPaste {
+			s.paste.Write(ready)
+		} else {
+			events = appendTerminalInputEvent(events, false, ready)
+		}
+		s.pending = append([]byte(nil), s.pending[len(s.pending)-keep:]...)
+		break
+	}
+	return events
+}
+
 // readLine dispatches to raw-mode if stdin is a TTY (gives us paste handling +
 // arrow-key history + clean editing), else falls back to cooked mode for pipes.
 func readLine(prompt string) (string, error) {
@@ -2197,8 +2824,6 @@ func readLineMode(prompt string, recordHistory bool) (string, error) {
 //     Ctrl-K (kill to end), Ctrl-C (cancel), Ctrl-D (EOF on empty line).
 //   - UTF-8 safe.
 func readLineRaw(prompt string, fd int, recordHistory bool) (string, error) {
-	fmt.Print(prompt)
-
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return readLineCooked(prompt, recordHistory)
@@ -2207,103 +2832,250 @@ func readLineRaw(prompt string, fd int, recordHistory bool) (string, error) {
 
 	// Enable bracketed paste in the terminal for the duration of input.
 	fmt.Print("\033[?2004h")
+	defer fmt.Print("\033[?2004l")
 
-	pLen := visibleLen(prompt)
-	// Cache terminal width once at entry. Used by redraw to compute how many
-	// physical rows a long input has wrapped onto so the redraw can clear
-	// them all (not just the row the cursor happens to be on after a wrap).
-	// Falls back to 80 if size detection fails.
-	termWidth := 80
-	if w, _, err := term.GetSize(fd); err == nil && w > 0 {
-		termWidth = w
+	// Cache terminal width once at entry. Every redraw uses explicit line
+	// breaks, so long input and embedded paste newlines have stable geometry.
+	termWidth, termHeight := 80, 24
+	if w, h, err := term.GetSize(fd); err == nil {
+		if w > 0 {
+			termWidth = w
+		}
+		if h > 0 {
+			termHeight = h
+		}
 	}
 	var line []rune
 	cursor := 0
 	histPos := len(inputHistory)
 	var savedDraft []rune
+	savedDraftBlock := false
+	pastedBlock := false
 
-	// redraw rewrites the prompt + current line in place. It handles the case
-	// where the input has wrapped across multiple physical terminal rows: it
-	// moves the cursor back up to the prompt row, clears from there to the
-	// end of the screen, then re-prints prompt + line, and positions the
-	// cursor at the correct in-line offset.
-	redraw := func() {
-		totalCols := pLen + len(line)
-		rowsUsed := 0
-		if totalCols > 0 {
-			rowsUsed = (totalCols - 1) / termWidth
-		}
-		// Step up to the prompt row, then erase from cursor to end of screen.
-		// `\r` returns to col 0 of current physical row; `\033[NA` moves up N
-		// rows; `\033[J` clears from cursor to end of screen (handles wrap).
-		if rowsUsed > 0 {
-			fmt.Printf("\r\033[%dA", rowsUsed)
+	display := renderEditableInput(prompt, line, cursor, termWidth, pastedBlock)
+	fmt.Print(display.text)
+
+	// redraw clears from the actual cursor row of the previous layout, renders
+	// the full explicit layout, then moves back from its end/footer to the
+	// logical editing cursor.
+	redrawDisplay := func(fullPaste bool) {
+		if display.endRow+1 >= termHeight {
+			fmt.Print("\033[2J\033[H")
 		} else {
 			fmt.Print("\r")
+			if display.cursorRow > 0 {
+				fmt.Printf("\033[%dA", display.cursorRow)
+			}
+			fmt.Print("\033[J")
 		}
-		fmt.Print("\033[J")
-		fmt.Print(prompt)
-		fmt.Print(string(line))
-		// If the logical cursor is inside the line (not at end), move the
-		// terminal cursor back to that position. We just printed up to end
-		// of line; cursor is now at the end. Work out the target row+col
-		// from the start of the prompt row, then move up + forward.
-		if cursor < len(line) {
-			targetCol := pLen + cursor
-			targetRow := 0
-			if targetCol > 0 {
-				targetRow = targetCol / termWidth
-			}
-			endCol := pLen + len(line)
-			endRow := 0
-			if endCol > 0 {
-				endRow = (endCol - 1) / termWidth
-			}
-			if endRow > targetRow {
-				fmt.Printf("\033[%dA", endRow-targetRow)
-			}
-			col := targetCol % termWidth
-			fmt.Print("\r")
-			if col > 0 {
-				fmt.Printf("\033[%dC", col)
-			}
+		display = renderEditableInput(prompt, line, cursor, termWidth, pastedBlock)
+		// A full paste is useful in scrollback as long as its logical cursor is
+		// still reachable from the rendered end (normally one footer row away).
+		if !fullPaste || display.endRow-display.cursorRow >= termHeight {
+			display = viewportEditableInput(display, termHeight)
 		}
+		fmt.Print(display.text)
+		if display.endRow > display.cursorRow {
+			fmt.Printf("\033[%dA", display.endRow-display.cursorRow)
+		}
+		fmt.Print("\r")
+		if display.cursorCol > 0 {
+			fmt.Printf("\033[%dC", display.cursorCol)
+		}
+	}
+	redraw := func() { redrawDisplay(false) }
+
+	moveBelowDisplay := func(suffix string) {
+		if display.endRow > display.cursorRow {
+			fmt.Printf("\033[%dB", display.endRow-display.cursorRow)
+		}
+		fmt.Print("\r")
+		if display.endCol > 0 {
+			fmt.Printf("\033[%dC", display.endCol)
+		}
+		fmt.Print(suffix + "\r\n")
 	}
 
 	insertAtCursor := func(s string) {
 		rs := []rune(s)
-		line = append(line[:cursor], append(rs, line[cursor:]...)...)
+		if len(rs) == 0 {
+			return
+		}
+		oldLen := len(line)
+		line = append(line, make([]rune, len(rs))...)
+		copy(line[cursor+len(rs):], line[cursor:oldLen])
+		copy(line[cursor:], rs)
 		cursor += len(rs)
 	}
 
 	saveDraftIfNeeded := func() {
 		if histPos == len(inputHistory) {
-			savedDraft = make([]rune, len(line))
-			copy(savedDraft, line)
+			savedDraft = append([]rune(nil), line...)
+			savedDraftBlock = pastedBlock
 		}
+	}
+
+	flushPaste := func(raw []byte) {
+		if len(raw) == 0 {
+			return
+		}
+		s := strings.ReplaceAll(string(raw), "\r\n", "\n")
+		s = strings.ReplaceAll(s, "\r", "\n")
+		insertAtCursor(s)
+		pastedBlock = true
+		redrawDisplay(true)
+	}
+
+	const (
+		inputContinue = iota
+		inputSubmit
+		inputCancel
+		inputEOF
+	)
+	var normalPending []byte
+	processNormal := func(data []byte) int {
+		normalPending = append(normalPending, data...)
+		for len(normalPending) > 0 {
+			if normalPending[0] == 0x1b {
+				if len(normalPending) < 2 {
+					break
+				}
+				if normalPending[1] != '[' {
+					normalPending = normalPending[1:]
+					continue
+				}
+				if len(normalPending) < 3 {
+					break
+				}
+				key := normalPending[2]
+				consumed := 3
+				if key == '3' {
+					if len(normalPending) < 4 {
+						break
+					}
+					if normalPending[3] == '~' {
+						consumed = 4
+					}
+				}
+				normalPending = normalPending[consumed:]
+				switch key {
+				case 'A':
+					if histPos > 0 {
+						saveDraftIfNeeded()
+						histPos--
+						line = []rune(inputHistory[histPos])
+						cursor = len(line)
+						pastedBlock = strings.ContainsRune(inputHistory[histPos], '\n')
+						redraw()
+					}
+				case 'B':
+					if histPos < len(inputHistory)-1 {
+						histPos++
+						line = []rune(inputHistory[histPos])
+						cursor = len(line)
+						pastedBlock = strings.ContainsRune(inputHistory[histPos], '\n')
+						redraw()
+					} else if histPos == len(inputHistory)-1 {
+						histPos++
+						line = append([]rune(nil), savedDraft...)
+						cursor = len(line)
+						pastedBlock = savedDraftBlock
+						redraw()
+					}
+				case 'C':
+					if cursor < len(line) {
+						cursor++
+						redraw()
+					}
+				case 'D':
+					if cursor > 0 {
+						cursor--
+						redraw()
+					}
+				case 'H':
+					cursor = 0
+					redraw()
+				case 'F':
+					cursor = len(line)
+					redraw()
+				case '3':
+					if consumed == 4 && cursor < len(line) {
+						line = append(line[:cursor], line[cursor+1:]...)
+						if len(line) == 0 {
+							pastedBlock = false
+						}
+						redraw()
+					}
+				}
+				continue
+			}
+
+			if !utf8.FullRune(normalPending) {
+				break
+			}
+			r, size := utf8.DecodeRune(normalPending)
+			normalPending = normalPending[size:]
+			if r == utf8.RuneError && size == 1 {
+				continue
+			}
+			if r < 32 || r == 127 {
+				switch r {
+				case '\r', '\n':
+					moveBelowDisplay("")
+					return inputSubmit
+				case 127, 8:
+					if cursor > 0 {
+						line = append(line[:cursor-1], line[cursor:]...)
+						cursor--
+						if len(line) == 0 {
+							pastedBlock = false
+						}
+						redraw()
+					}
+				case 3:
+					moveBelowDisplay("^C")
+					return inputCancel
+				case 4:
+					if len(line) == 0 {
+						moveBelowDisplay("")
+						return inputEOF
+					}
+				case 1:
+					cursor = 0
+					redraw()
+				case 5:
+					cursor = len(line)
+					redraw()
+				case 11:
+					line = line[:cursor]
+					if len(line) == 0 {
+						pastedBlock = false
+					}
+					redraw()
+				case 21:
+					line = nil
+					cursor = 0
+					pastedBlock = false
+					redraw()
+				case 12:
+					fmt.Print("\033[2J\033[H")
+					display = editableInputDisplay{}
+					redraw()
+				}
+				continue
+			}
+
+			line = append(line, 0)
+			copy(line[cursor+1:], line[cursor:len(line)-1])
+			line[cursor] = r
+			cursor++
+			redraw()
+		}
+		return inputContinue
 	}
 
 	buf := make([]byte, 4096)
-	pasteBuf := bytes.Buffer{}
-	inPaste := false
-
-	flushPaste := func() {
-		if pasteBuf.Len() == 0 {
-			return
-		}
-		s := pasteBuf.String()
-		pasteBuf.Reset()
-		nLines := strings.Count(s, "\n") + 1
-		s = strings.ReplaceAll(s, "\r\n", "\n")
-		s = strings.ReplaceAll(s, "\r", "\n")
-		insertAtCursor(s)
-		redraw()
-		if nLines > 1 {
-			fmt.Printf("\r\n  %s(%d lines pasted)%s\r\n", cDim, nLines, cReset)
-			redraw()
-		}
-	}
-
+	pasteStream := &bracketedPasteStream{}
 	for {
 		n, err := os.Stdin.Read(buf)
 		if err != nil {
@@ -2316,136 +3088,22 @@ func readLineRaw(prompt string, fd int, recordHistory bool) (string, error) {
 			continue
 		}
 
-		i := 0
-		for i < n {
-			if inPaste {
-				rest := buf[i:n]
-				end := bytes.Index(rest, []byte("\x1b[201~"))
-				if end >= 0 {
-					pasteBuf.Write(rest[:end])
-					inPaste = false
-					i += end + 6
-					flushPaste()
-					continue
-				}
-				pasteBuf.Write(rest)
-				i = n
+		for _, event := range pasteStream.feed(buf[:n]) {
+			if event.pasted {
+				// A partial ordinary escape/rune immediately before a paste marker
+				// cannot form a valid editing key across the paste boundary.
+				normalPending = nil
+				flushPaste(event.data)
 				continue
 			}
-
-			if buf[i] == 0x1b && i+5 < n && string(buf[i:i+6]) == "\x1b[200~" {
-				inPaste = true
-				i += 6
-				continue
+			switch processNormal(event.data) {
+			case inputSubmit:
+				return string(line), nil
+			case inputCancel:
+				return "", nil
+			case inputEOF:
+				return "", io.EOF
 			}
-
-			if buf[i] == 0x1b {
-				if i+2 < n && buf[i+1] == '[' {
-					key := buf[i+2]
-					i += 3
-					switch key {
-					case 'A':
-						if histPos > 0 {
-							saveDraftIfNeeded()
-							histPos--
-							line = []rune(inputHistory[histPos])
-							cursor = len(line)
-							redraw()
-						}
-					case 'B':
-						if histPos < len(inputHistory)-1 {
-							histPos++
-							line = []rune(inputHistory[histPos])
-							cursor = len(line)
-							redraw()
-						} else if histPos == len(inputHistory)-1 {
-							histPos++
-							line = make([]rune, len(savedDraft))
-							copy(line, savedDraft)
-							cursor = len(line)
-							redraw()
-						}
-					case 'C':
-						if cursor < len(line) {
-							cursor++
-							redraw()
-						}
-					case 'D':
-						if cursor > 0 {
-							cursor--
-							redraw()
-						}
-					case 'H':
-						cursor = 0
-						redraw()
-					case 'F':
-						cursor = len(line)
-						redraw()
-					case '3':
-						if i < n && buf[i] == '~' {
-							i++
-							if cursor < len(line) {
-								line = append(line[:cursor], line[cursor+1:]...)
-								redraw()
-							}
-						}
-					}
-					continue
-				}
-				i++
-				continue
-			}
-
-			r, size := utf8.DecodeRune(buf[i:n])
-			if r == utf8.RuneError && size == 1 {
-				i++
-				continue
-			}
-
-			if r < 32 || r == 127 {
-				switch r {
-				case '\r', '\n':
-					fmt.Print("\r\n")
-					return string(line), nil
-				case 127, 8:
-					if cursor > 0 {
-						line = append(line[:cursor-1], line[cursor:]...)
-						cursor--
-						redraw()
-					}
-				case 3:
-					fmt.Print("^C\r\n")
-					return "", nil
-				case 4:
-					if len(line) == 0 {
-						fmt.Print("\r\n")
-						return "", io.EOF
-					}
-				case 1:
-					cursor = 0
-					redraw()
-				case 5:
-					cursor = len(line)
-					redraw()
-				case 11:
-					line = line[:cursor]
-					redraw()
-				case 21:
-					line = nil
-					cursor = 0
-					redraw()
-				case 12:
-					fmt.Print("\033[2J\033[H")
-					redraw()
-				}
-				i += size
-				continue
-			}
-
-			line = append(line[:cursor], append([]rune{r}, line[cursor:]...)...)
-			cursor++
-			redraw()
-			i += size
 		}
 	}
 }
@@ -3307,7 +3965,189 @@ func withNoThink(messages []message) []message {
 	return out
 }
 
+type deepSeekChatMessage struct {
+	Role             string  `json:"role"`
+	Content          *string `json:"content"`
+	ReasoningContent string  `json:"reasoning_content,omitempty"`
+}
+
+type deepSeekChatResponse struct {
+	Model   string `json:"model"`
+	Choices []struct {
+		Message      deepSeekChatMessage `json:"message"`
+		FinishReason string              `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+func boundedCloudError(body []byte, secrets ...string) string {
+	message := strings.TrimSpace(string(body))
+	for _, secret := range secrets {
+		if strings.TrimSpace(secret) != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	if len(message) > 2048 {
+		message = message[:2048] + "…"
+	}
+	if message == "" {
+		return "empty response body"
+	}
+	return message
+}
+
+const modelProviderFailureResponse = `{"text":"","command":"","search":"","status":"question"}`
+
+// deepSeekChat adapts SecorizonAI's existing structured text/command/search
+// protocol to DeepSeek's OpenAI-compatible Chat Completions endpoint. The
+// autonomous executor remains provider-independent: DeepSeek emits the same
+// ModelResponse JSON envelope as Ollama, and the existing loop executes it.
+func deepSeekChat(messages []message, spinners ...*spinner) (string, bool) {
+	updateHistorySnapshot(messages)
+	if strings.TrimSpace(cloudAPIKey) == "" {
+		if len(spinners) > 0 && spinners[0] != nil {
+			spinners[0].finish()
+		}
+		fmt.Printf("%s[DeepSeek API key is not configured; use /cloudmodel deepseek]%s\n", cRed, cReset)
+		return modelProviderFailureResponse, false
+	}
+	requestAPIKey, _, keyErr := normalizeCloudAPIKey(cloudAPIKey)
+	if keyErr != nil {
+		if len(spinners) > 0 && spinners[0] != nil {
+			spinners[0].finish()
+		}
+		fmt.Printf("%s[DeepSeek credential is invalid: %v; run /cloudmodel deepseek to replace it]%s\n",
+			cRed, keyErr, cReset)
+		return modelProviderFailureResponse, false
+	}
+	cloudAPIKey = requestAPIKey
+	ctx, ctxCancel := context.WithCancel(context.Background())
+	streamMu.Lock()
+	streamID++
+	activeStreamID := streamID
+	streamCancel = ctxCancel
+	interrupted = false
+	streamMu.Unlock()
+	defer func() {
+		ctxCancel()
+		streamMu.Lock()
+		if streamID == activeStreamID {
+			streamCancel = nil
+		}
+		streamMu.Unlock()
+	}()
+
+	finishSpinner := func() {
+		if len(spinners) > 0 && spinners[0] != nil {
+			spinners[0].finish()
+			spinners[0] = nil
+		}
+	}
+
+	converted := make([]deepSeekChatMessage, 0, len(messages))
+	for _, msg := range messages {
+		content := msg.Content
+		converted = append(converted, deepSeekChatMessage{Role: msg.Role, Content: &content})
+	}
+	payload := struct {
+		Model    string                `json:"model"`
+		Messages []deepSeekChatMessage `json:"messages"`
+		Thinking struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+		ResponseFormat struct {
+			Type string `json:"type"`
+		} `json:"response_format"`
+		Stream bool `json:"stream"`
+	}{Model: model, Messages: converted, Stream: false}
+	payload.Thinking.Type = "disabled"
+	if thinkMode {
+		payload.Thinking.Type = "enabled"
+	}
+	payload.ResponseFormat.Type = "json_object"
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		finishSpinner()
+		fmt.Printf("%s[DeepSeek request error: %v]%s\n", cRed, err, cReset)
+		return modelProviderFailureResponse, false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cloudBaseURL, "/")+"/chat/completions", bytes.NewReader(encoded))
+	if err != nil {
+		finishSpinner()
+		fmt.Printf("%s[DeepSeek request error: %v]%s\n", cRed, err, cReset)
+		return modelProviderFailureResponse, false
+	}
+	req.Header.Set("Authorization", "Bearer "+requestAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := deepSeekHTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Minute}
+	}
+	started := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		finishSpinner()
+		if ctx.Err() != nil {
+			fmt.Printf("\n  %s[stopped]%s\n", cRed, cReset)
+			return "", true
+		}
+		fmt.Printf("%s[DeepSeek error: %s]%s\n", cRed, boundedCloudError([]byte(err.Error()), requestAPIKey), cReset)
+		return modelProviderFailureResponse, false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		finishSpinner()
+		fmt.Printf("%s[DeepSeek response error: %v]%s\n", cRed, err, cReset)
+		return modelProviderFailureResponse, false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		finishSpinner()
+		fmt.Printf("%s[DeepSeek returned %s: %s]%s\n", cRed, resp.Status, boundedCloudError(body, requestAPIKey), cReset)
+		return modelProviderFailureResponse, false
+	}
+	var decoded deepSeekChatResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		finishSpinner()
+		fmt.Printf("%s[DeepSeek response decode error: %v]%s\n", cRed, err, cReset)
+		return modelProviderFailureResponse, false
+	}
+	if len(decoded.Choices) == 0 || decoded.Choices[0].Message.Content == nil {
+		finishSpinner()
+		fmt.Printf("%s[DeepSeek response contained no message content]%s\n", cRed, cReset)
+		return modelProviderFailureResponse, false
+	}
+	finishSpinner()
+	result := *decoded.Choices[0].Message.Content
+	fmt.Print("\n  ")
+	renderer := &streamRender{}
+	renderer.feed(result)
+	renderer.finish()
+
+	duration := time.Since(started)
+	totalTokens := decoded.Usage.PromptTokens + decoded.Usage.CompletionTokens
+	servedModel := strings.TrimSpace(decoded.Model)
+	if servedModel == "" {
+		servedModel = model
+	}
+	fmt.Printf("%s[%s]%s %s tokens | prompt %d | gen %d | %.1fs total%s\n",
+		cDim, servedModel, cReset+cDim, formatShort(totalTokens), decoded.Usage.PromptTokens,
+		decoded.Usage.CompletionTokens, duration.Seconds(), cReset)
+	if decoded.Choices[0].FinishReason == "length" {
+		fmt.Printf("  %s[DeepSeek stopped at its output/context limit; incomplete JSON will be retried by the agent loop]%s\n", cYellow, cReset)
+	}
+	return result, false
+}
+
 func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
+	if modelBackend == deepSeekProvider {
+		return deepSeekChat(messages, spinners...)
+	}
 	// The request slice is stable for the duration of this call. Publish an
 	// immutable checkpoint before blocking on inference so SIGTERM/SIGHUP can
 	// persist the user's latest prompt without racing the main slice.
@@ -3599,6 +4439,7 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 		}
 		fmt.Printf("%s[%s]%s %s tokens |%s prompt %.0ftk/s | gen %.1ftk/s | %.1fs total%s\n",
 			cDim, model, cReset+cDim, formatShort(totalT), loadHint, pTps, gTps, durSec, cReset)
+		reportRemotePlacementAfterLoad(model)
 	}
 
 	return result, false
@@ -3648,14 +4489,32 @@ func networkFailureReason(output string) string {
 	return ""
 }
 
-// gpuInfo describes the host's GPU capacity. Populated once at startup via
-// nvidia-smi; values are zero if no NVIDIA GPUs are present (Ollama may
-// still be running CPU-only or on AMD/Apple).
+// gpuInfo describes the local Ollama host's GPU capacity. It is populated via
+// nvidia-smi only when OLLAMA_URL points at this machine; client-side GPUs are
+// irrelevant when inference runs on a remote daemon.
 type gpuInfo struct {
 	count       int
 	totalMB     int
 	minMB       int // smallest GPU's VRAM — the per-GPU ceiling
 	descriptors []string
+}
+
+// ollamaServerIsRemote reports whether the configured Ollama HTTP endpoint is
+// on another host. Loopback and wildcard addresses are local; names such as
+// host.docker.internal are remote from the shell/container's perspective.
+func ollamaServerIsRemote(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" || host == "localhost" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsLoopback() && !ip.IsUnspecified()
+	}
+	return true
 }
 
 // detectGPUs queries nvidia-smi for GPU count + per-GPU VRAM. Returns
@@ -3744,28 +4603,134 @@ func snapCtx(tokens int) int {
 	}
 }
 
-// listLoadedModels returns the names of all models currently warm in VRAM.
-// Used at startup to evict competitors so our model gets uncontested headroom.
-func listLoadedModels() []string {
+type ollamaProcessInfo struct {
+	Name          string
+	Model         string
+	Size          int64
+	SizeVRAM      int64
+	VRAMReported  bool
+	ContextLength int
+}
+
+// listLoadedModelInfo queries Ollama's public /api/ps endpoint. For remote
+// servers this is the only portable hardware-placement signal: Ollama exposes
+// model size and size_vram, but not GPU names, count, or total VRAM capacity.
+func listLoadedModelInfo() []ollamaProcessInfo {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(ollamaURL + "/api/ps")
 	if err != nil {
 		return nil
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
 	var data struct {
 		Models []struct {
-			Name string `json:"name"`
+			Name          string `json:"name"`
+			Model         string `json:"model"`
+			Size          int64  `json:"size"`
+			SizeVRAM      *int64 `json:"size_vram"`
+			ContextLength int    `json:"context_length"`
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil
 	}
-	out := make([]string, 0, len(data.Models))
+	out := make([]ollamaProcessInfo, 0, len(data.Models))
 	for _, m := range data.Models {
-		out = append(out, m.Name)
+		info := ollamaProcessInfo{
+			Name: m.Name, Model: m.Model, Size: m.Size, ContextLength: m.ContextLength,
+		}
+		if m.SizeVRAM != nil {
+			info.SizeVRAM = *m.SizeVRAM
+			info.VRAMReported = true
+		}
+		out = append(out, info)
 	}
 	return out
+}
+
+func ollamaModelNamesMatch(want string, info ollamaProcessInfo) bool {
+	alt := want
+	if !strings.Contains(want, ":") {
+		alt = want + ":latest"
+	}
+	return info.Name == want || info.Name == alt || info.Model == want || info.Model == alt
+}
+
+func findLoadedModelInfo(models []ollamaProcessInfo, name string) (ollamaProcessInfo, bool) {
+	for _, info := range models {
+		if ollamaModelNamesMatch(name, info) {
+			return info, true
+		}
+	}
+	return ollamaProcessInfo{}, false
+}
+
+func remoteModelPlacementDescription(info ollamaProcessInfo) string {
+	name := info.Name
+	if name == "" {
+		name = info.Model
+	}
+	if name == "" {
+		name = "current model"
+	}
+	prefix := "remote Ollama · " + sanitizeForTerminal(name)
+	if !info.VRAMReported {
+		return prefix + " · loaded (GPU/CPU split not reported by this server)"
+	}
+	if info.SizeVRAM <= 0 {
+		return prefix + " · 100% CPU · 0 GB model VRAM"
+	}
+	gpuPct := 100
+	if info.Size > 0 {
+		gpuPct = int((info.SizeVRAM*100 + info.Size/2) / info.Size)
+		if gpuPct < 1 {
+			gpuPct = 1
+		}
+		if gpuPct > 100 {
+			gpuPct = 100
+		}
+	}
+	placement := "100% GPU"
+	if gpuPct < 100 {
+		placement = fmt.Sprintf("%d%% GPU / %d%% CPU", gpuPct, 100-gpuPct)
+	}
+	vramGB := float64(info.SizeVRAM) / (1024 * 1024 * 1024)
+	return fmt.Sprintf("%s · %s · %.1f GB model VRAM", prefix, placement, vramGB)
+}
+
+var (
+	remotePlacementShown   = map[string]bool{}
+	remotePlacementShownMu sync.Mutex
+)
+
+func markRemotePlacementShown(name string) {
+	remotePlacementShownMu.Lock()
+	remotePlacementShown[name] = true
+	remotePlacementShownMu.Unlock()
+}
+
+// reportRemotePlacementAfterLoad prints the remote model's placement once.
+// A cold model is absent from /api/ps at banner time; after the first completed
+// generation it is warm and size_vram is available.
+func reportRemotePlacementAfterLoad(name string) {
+	if !ollamaServerIsRemote(ollamaURL) {
+		return
+	}
+	remotePlacementShownMu.Lock()
+	alreadyShown := remotePlacementShown[name]
+	remotePlacementShownMu.Unlock()
+	if alreadyShown {
+		return
+	}
+	info, ok := findLoadedModelInfo(listLoadedModelInfo(), name)
+	if !ok {
+		return
+	}
+	fmt.Printf("  %sGPU: %s%s\n", cDim, remoteModelPlacementDescription(info), cReset)
+	markRemotePlacementShown(name)
 }
 
 // modelDiskSizeMB queries Ollama /api/tags for the named model's on-disk
@@ -3830,8 +4795,12 @@ func unloadOllamaModel(name string) error {
 // loaded. Used by /model to validate before switching and to mark
 // not-yet-available models in the listing.
 func ollamaModelExists(name string) bool {
+	return ollamaModelExistsAt(ollamaURL, name)
+}
+
+func ollamaModelExistsAt(baseURL, name string) bool {
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(ollamaURL + "/api/tags")
+	resp, err := client.Get(strings.TrimRight(baseURL, "/") + "/api/tags")
 	if err != nil {
 		return false
 	}
@@ -4232,6 +5201,160 @@ func hasInlineCodeFlag(bin string, argv []string) bool {
 	return false
 }
 
+const safeShellSubstitutionPlaceholder = "__secorizon_checked_substitution__"
+
+func closingBacktick(source string, start int) (body string, end int, ok bool) {
+	for i := start + 1; i < len(source); i++ {
+		if source[i] == '\\' {
+			i++
+			continue
+		}
+		if source[i] == '`' {
+			return source[start+1 : i], i + 1, true
+		}
+	}
+	return "", 0, false
+}
+
+// balancedShellParens returns the contents/end of a shell construct whose
+// opening '(' is at open. Quotes, escaped bytes, nested parentheses, nested
+// substitutions inside double quotes, and legacy backticks are respected.
+func balancedShellParens(source string, open int) (body string, end int, ok bool) {
+	if open < 0 || open >= len(source) || source[open] != '(' {
+		return "", 0, false
+	}
+	depth := 1
+	var quote byte
+	for i := open + 1; i < len(source); i++ {
+		c := source[i]
+		if quote == '\'' {
+			if c == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\\' {
+			i++
+			continue
+		}
+		if quote == '"' {
+			if c == '"' {
+				quote = 0
+				continue
+			}
+			if c == '`' {
+				_, nestedEnd, found := closingBacktick(source, i)
+				if !found {
+					return "", 0, false
+				}
+				i = nestedEnd - 1
+				continue
+			}
+			if c == '$' && i+1 < len(source) && source[i+1] == '(' {
+				_, nestedEnd, found := balancedShellParens(source, i+1)
+				if !found {
+					return "", 0, false
+				}
+				i = nestedEnd - 1
+			}
+			continue
+		}
+
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '`':
+			_, nestedEnd, found := closingBacktick(source, i)
+			if !found {
+				return "", 0, false
+			}
+			i = nestedEnd - 1
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return source[open+1 : i], i + 1, true
+			}
+		}
+	}
+	return "", 0, false
+}
+
+// screenShellIndirections recursively screens commands executed by $(...),
+// legacy backticks, and <(...)/>(...). Safe bodies are replaced with an inert
+// token before the outer command is tokenized, so separators inside a checked
+// substitution are not mistaken for top-level shell operators. Malformed or
+// excessively nested syntax stays confirmation-gated.
+func screenShellIndirections(command string, depth int) (string, bool) {
+	if depth > 24 {
+		return "", true
+	}
+	var out strings.Builder
+	out.Grow(len(command))
+	var quote byte
+	for i := 0; i < len(command); {
+		c := command[i]
+		if quote == '\'' {
+			out.WriteByte(c)
+			i++
+			if c == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\\' {
+			out.WriteByte(c)
+			i++
+			if i < len(command) {
+				out.WriteByte(command[i])
+				i++
+			}
+			continue
+		}
+		if c == '\'' {
+			quote = c
+			out.WriteByte(c)
+			i++
+			continue
+		}
+		if c == '"' {
+			if quote == '"' {
+				quote = 0
+			} else {
+				quote = '"'
+			}
+			out.WriteByte(c)
+			i++
+			continue
+		}
+
+		if c == '`' {
+			body, end, ok := closingBacktick(command, i)
+			if !ok || isDangerousDepth(body, depth+1) {
+				return "", true
+			}
+			out.WriteString(safeShellSubstitutionPlaceholder)
+			i = end
+			continue
+		}
+		isSubstitution := i+1 < len(command) && command[i+1] == '(' &&
+			(c == '$' || c == '<' || c == '>')
+		if isSubstitution {
+			body, end, ok := balancedShellParens(command, i+1)
+			if !ok || isDangerousDepth(body, depth+1) {
+				return "", true
+			}
+			out.WriteString(safeShellSubstitutionPlaceholder)
+			i = end
+			continue
+		}
+		out.WriteByte(c)
+		i++
+	}
+	return out.String(), false
+}
+
 // checkBinDanger applies the per-binary danger rules (rm, dd, find -delete,
 // installer-install, mkfs.*, dangerousBins, etc.). Used both for top-level
 // command tokens and for the post-`sudo` target so `sudo systemctl reboot`,
@@ -4321,6 +5444,10 @@ func checkBinDanger(bin string, argv []string) bool {
 }
 
 func isDangerous(cmd string) bool {
+	return isDangerousDepth(cmd, 0)
+}
+
+func isDangerousDepth(cmd string, depth int) bool {
 	checkStr := cmd
 	if idx := strings.Index(cmd, "<<"); idx > 0 {
 		// Heredoc body could still smuggle danger via `bash <<EOF\n rm -rf /\nEOF`.
@@ -4331,10 +5458,12 @@ func isDangerous(cmd string) bool {
 		}
 		checkStr = cmd[:idx]
 	}
-	lcNorm := strings.ToLower(strings.Join(strings.Fields(checkStr), " "))
-	if indirectShellSyntaxRe.MatchString(checkStr) {
+	var indirectDanger bool
+	checkStr, indirectDanger = screenShellIndirections(checkStr, depth)
+	if indirectDanger {
 		return true
 	}
+	lcNorm := strings.ToLower(strings.Join(strings.Fields(checkStr), " "))
 
 	for _, p := range dangerousSubstrings {
 		if strings.Contains(lcNorm, p) {
@@ -4373,6 +5502,13 @@ func isDangerous(cmd string) bool {
 		}
 		bin := normalizeBin(tokens[i])
 		argv := tokens[i+1:]
+		// A substitution that produces the executable name is inherently
+		// dynamic: even a harmless inner `printf` can output `rm ...`. Keep that
+		// use confirmation-gated while allowing checked substitutions in variable
+		// assignments and ordinary arguments.
+		if strings.Contains(bin, safeShellSubstitutionPlaceholder) {
+			return true
+		}
 
 		if checkBinDanger(bin, argv) {
 			return true
@@ -4395,6 +5531,9 @@ func isDangerous(cmd string) bool {
 			if j < len(argv) {
 				target := normalizeBin(argv[j])
 				sudoArgv := argv[j+1:]
+				if strings.Contains(target, safeShellSubstitutionPlaceholder) {
+					return true
+				}
 				if dangerousSudoTargets[target] {
 					return true
 				}
@@ -4796,6 +5935,10 @@ func runCommandWithOptions(cmd string, opts commandRunOptions) string {
 
 func banner() {
 	// italic is defined globally
+	modelLabel := model
+	if modelBackend == deepSeekProvider {
+		modelLabel = deepSeekProvider + "/" + model
+	}
 	fmt.Printf(`
   %s%s                          _               %s%s   _    ___
   %s  ___  ___  ___ ___  _ __(_)_______  _ __ %s  / \  |_ _|
@@ -4803,7 +5946,7 @@ func banner() {
   %s \__ \  __/ (_| (_) | |  | |/ / (_) | | | %s/ ___ \ | |
   %s |___/\___|\___\___/|_|  |_/___\___/|_| |_%s/_/ \_\|___|%s
 
-  %s%sv1.2%s %s— el8 security research AI%s
+  %s%sv1.3%s %s— el8 security research AI%s
   %sAuthor: Laurent Gaffie%s  %s·%s  %shttps://secorizon.com%s  %s·%s  %stwitter.com/secorizon%s
   %smodel: %s%s  %s│%s  %s/help for commands%s
 
@@ -4814,7 +5957,7 @@ func banner() {
 		cCyan+cBold, cBold+cGreen, cReset,
 		cBold, cGreen, cReset, cDim, cReset,
 		cDim, cReset, cDim, cReset, cDim, cReset, cDim, cReset, cDim, cReset,
-		cDim, model, cReset, cDim, cReset, cDim, cReset)
+		cDim, modelLabel, cReset, cDim, cReset, cDim, cReset)
 }
 
 // ── Help ────────────────────────────────────────────────────────────────────
@@ -4826,12 +5969,15 @@ func printHelp() {
   %s/help%s                       Show this help
   %s/clear%s                      Clear conversation context (keeps system prompt)
   %s/model%s [alias|tag]          Show current model, or switch (e.g. /model v2, /model llama3.1:8b).
-                              On switch the previous model is evicted from VRAM.
-  %s/think%s                      Toggle Think++ mode (model emits <think>…</think> before its answer)
-  %s/fast%s                       Toggle fast mode. OFF (default): full 250K context.
-                              ON: a small, faster context — fewer tokens, quicker per turn.
+                              Changes the active local or cloud model.
+  %s/cloudmodel%s deepseek [model] Persistently use DeepSeek (default: deepseek-v4-flash).
+                              Prompts for a masked API key; blank keeps the saved key.
+  %s/localmodel%s [model]          Persistently switch back to Ollama.
+  %s/think%s                      Toggle provider-native/prompt-based Think++ reasoning.
+  %s/fast%s                       Toggle fast mode. Local: GPU-sized/250K context.
+                              DeepSeek: 16K/128K active harness budget.
   %s/ctx%s [N]                    Show or set context window (e.g. /ctx 16k, /ctx 65536, /ctx 250k).
-                              Range 2048–1M. Shrinking auto-reloads the model at the new size.
+                              Range 2048–1M. Local shrink reloads Ollama; cloud changes the harness budget.
   %s/guides%s [name|all|off]      Load a methodology guide on-demand (off by default).
                               /guides            list available + currently loaded
                               /guides recon      inject one (also: web, code, methodology, smart-contract, …)
@@ -4848,12 +5994,13 @@ func printHelp() {
   %s!<command>%s                  Run a shell command directly (no AI involvement)
   %s/exit%s                       Save session log + input history and exit
 
-%s  Stats line after each reply: [model] tokens | prompt N tk/s | gen N tk/s | total Xs%s
-%s  load X.Xs only shown if the model just reloaded (eviction or first turn).%s
+%s  Stats: Ollama shows throughput/load; DeepSeek shows provider prompt/gen token counts.%s
+%s  Every backend reports the served model, total tokens, and wall-clock time.%s
 %s  Press Ctrl+C to interrupt a command or model stream. /exit (or Ctrl+D ×2) to quit.%s
 
 `, cBold, cCyan, cReset, // banner
 		cBold, cReset, cBold, cReset, cBold, cReset, // /help, /clear, /model
+		cBold, cReset, cBold, cReset, // /cloudmodel, /localmodel
 		cBold, cReset, // /think
 		cBold, cReset, cBold, cReset, cBold, cReset, // /fast, /ctx, /guides
 		cBold, cReset, // /burp
@@ -4888,88 +6035,124 @@ func main() {
 	fmt.Print("\033[?2004h")
 	defer fmt.Print("\033[?2004l")
 
+	if err := applyPersistentModelSelection(); err != nil {
+		fmt.Printf("  %sModel configuration error: %v%s\n", cRed, err, cReset)
+		return
+	}
 	banner()
+	remoteOllama := ollamaServerIsRemote(ollamaURL)
+	gpus := gpuInfo{}
+	modelMB := 0
 
-	// Check Ollama connection
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(ollamaURL + "/api/tags")
-	if err != nil {
-		fmt.Printf("  %sCannot connect to Ollama: %v%s\n", cRed, err, cReset)
-		fmt.Printf("  %sStart it with: ollama serve%s\n", cDim, cReset)
-		return
-	}
-	defer resp.Body.Close()
-
-	var tagsResp struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
-	json.NewDecoder(resp.Body).Decode(&tagsResp)
-	// Normalize: ollama tags always include a tag suffix; if the user passed
-	// "secorizon" (no colon), match it against "secorizon:latest".
-	wantedAlt := model
-	if !strings.Contains(model, ":") {
-		wantedAlt = model + ":latest"
-	}
-	found := false
-	var modelNames []string
-	for _, m := range tagsResp.Models {
-		modelNames = append(modelNames, m.Name)
-		if m.Name == model || m.Name == wantedAlt {
-			found = true
+	if modelBackend == localModelBackend {
+		// Check Ollama connection only for the local backend. A persisted
+		// DeepSeek selection must start without a local/remote Ollama daemon.
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(ollamaURL + "/api/tags")
+		if err != nil {
+			fmt.Printf("  %sCannot connect to Ollama: %v%s\n", cRed, err, cReset)
+			fmt.Printf("  %sStart it with: ollama serve%s\n", cDim, cReset)
+			return
 		}
+		defer resp.Body.Close()
+
+		var tagsResp struct {
+			Models []struct {
+				Name string `json:"name"`
+			} `json:"models"`
+		}
+		json.NewDecoder(resp.Body).Decode(&tagsResp)
+		// Normalize: ollama tags always include a tag suffix; if the user passed
+		// "secorizon" (no colon), match it against "secorizon:latest".
+		wantedAlt := model
+		if !strings.Contains(model, ":") {
+			wantedAlt = model + ":latest"
+		}
+		found := false
+		var modelNames []string
+		for _, m := range tagsResp.Models {
+			modelNames = append(modelNames, m.Name)
+			if m.Name == model || m.Name == wantedAlt {
+				found = true
+			}
+		}
+		if !found {
+			fmt.Printf("  %sModel '%s' not found in Ollama.%s\n", cRed, model, cReset)
+			fmt.Printf("  %sAvailable: %s%s\n", cDim, strings.Join(modelNames, ", "), cReset)
+			return
+		}
+		fmt.Printf("  %sConnected to Ollama.%s Type anything. /exit to quit.\n", cGreen, cReset)
+
+		// Evict any other model currently warm in VRAM. Otherwise on a system
+		// with OLLAMA_MAX_LOADED_MODELS>=2 you can end up ping-ponging between
+		// our model and someone else's keep-alive'd model.
+		loadedModels := listLoadedModelInfo()
+		for _, other := range loadedModels {
+			if ollamaModelNamesMatch(model, other) {
+				continue
+			}
+			otherName := other.Name
+			if otherName == "" {
+				otherName = other.Model
+			}
+			if otherName == "" {
+				continue
+			}
+			_ = unloadOllamaModel(otherName)
+			fmt.Printf("  %sevicted stale model from VRAM: %s%s\n", cDim, otherName, cReset)
+		}
+
+		remoteOllama = ollamaServerIsRemote(ollamaURL)
+		if !remoteOllama {
+			gpus = detectGPUs()
+		}
+		modelMB = modelDiskSizeMB(model)
+		if v := os.Getenv("SECORIZON_NUM_CTX"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 2048 {
+				numCtx = n
+			}
+		}
+		fastMode = numCtx <= 32768
+
+		if remoteOllama {
+			if info, ok := findLoadedModelInfo(loadedModels, model); ok {
+				fmt.Printf("  %sGPU: %s%s\n", cDim, remoteModelPlacementDescription(info), cReset)
+				markRemotePlacementShown(model)
+			} else {
+				fmt.Printf("  %sGPU: remote Ollama server · model not loaded; placement will be reported after the first response%s\n", cDim, cReset)
+			}
+		} else if gpus.count > 0 {
+			fmt.Printf("  %sGPU: %s · %d GB total%s\n",
+				cDim, strings.Join(gpus.descriptors, " + "), gpus.totalMB/1024, cReset)
+		} else {
+			fmt.Printf("  %sGPU: none detected (Ollama may CPU-offload — expect slow inference)%s\n", cYellow, cReset)
+		}
+	} else {
+		fmt.Printf("  %sDeepSeek backend selected.%s Type anything. /exit to quit.\n", cGreen, cReset)
+		if cloudAPIKey == "" {
+			fmt.Printf("  %sDeepSeek credential is not configured — run /cloudmodel deepseek %s%s\n", cYellow, deepSeekDefaultModel, cReset)
+		} else {
+			fmt.Printf("  %scloud credential: configured%s\n", cDim, cReset)
+		}
+		if v := os.Getenv("SECORIZON_NUM_CTX"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 2048 {
+				numCtx = min(n, deepSeekContextTokens)
+			}
+		} else {
+			numCtx = deepSeekPromptBudget
+		}
+		fastMode = numCtx <= 32768
+		fmt.Printf("  %scloud context: provider capability 1M · active harness budget %dK%s\n", cDim, numCtx/1024, cReset)
 	}
-	if !found {
-		fmt.Printf("  %sModel '%s' not found in Ollama.%s\n", cRed, model, cReset)
-		fmt.Printf("  %sAvailable: %s%s\n", cDim, strings.Join(modelNames, ", "), cReset)
-		return
-	}
-	// Clean up stale temp files from previous sessions. Glob the system
-	// tmpdir, not a hardcoded /tmp, so we match where os.CreateTemp actually
-	// writes (TMPDIR override on macOS / sandboxes).
+
+	// Clean up stale temp files from previous sessions for either backend.
 	staleFiles, _ := filepath.Glob(filepath.Join(os.TempDir(), "secorizon_bg_*.txt"))
 	for _, f := range staleFiles {
-		os.Remove(f)
+		_ = os.Remove(f)
 	}
-
-	fmt.Printf("  %sConnected.%s Type anything. /exit to quit.\n", cGreen, cReset)
-
-	// Evict any other model currently warm in VRAM. Otherwise on a system
-	// with OLLAMA_MAX_LOADED_MODELS>=2 you can end up ping-ponging between
-	// our model and someone else's keep-alive'd model — each turn paying
-	// the full reload cost (30-120s for a 19GB blob).
-	for _, other := range listLoadedModels() {
-		if other == model {
-			continue
-		}
-		_ = unloadOllamaModel(other)
-		fmt.Printf("  %sevicted stale model from VRAM: %s%s\n", cDim, other, cReset)
+	if modelBackend == localModelBackend {
+		fmt.Printf("  %scontext: %dK tokens%s\n", cDim, numCtx/1024, cReset)
 	}
-
-	// Detect host GPUs once — used for the placement hint on the banner.
-	// We do NOT auto-resize numCtx from detection; the 250K default is used and
-	// the user can pin a different value via:
-	//   SECORIZON_NUM_CTX env at launch (highest precedence)
-	//   /ctx <N> at runtime
-	gpus := detectGPUs()
-	modelMB := modelDiskSizeMB(model)
-	if v := os.Getenv("SECORIZON_NUM_CTX"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 2048 {
-			numCtx = n
-		}
-	}
-	fastMode = numCtx <= 32768
-
-	if gpus.count > 0 {
-		fmt.Printf("  %sGPU: %s · %d GB total%s\n",
-			cDim, strings.Join(gpus.descriptors, " + "), gpus.totalMB/1024, cReset)
-	} else {
-		fmt.Printf("  %sGPU: none detected (Ollama may CPU-offload — expect slow inference)%s\n", cYellow, cReset)
-	}
-
-	fmt.Printf("  %scontext: %dK tokens%s\n",
-		cDim, numCtx/1024, cReset)
 
 	// Burp MCP — created but NOT connected. User opts in via /burp.
 	burpMCP := newBurpMCP(envOr("BURP_MCP_URL", "http://127.0.0.1:9876"))
@@ -5307,9 +6490,135 @@ func main() {
 			continue
 		}
 
+		if lower == "/cloudmodel" || strings.HasPrefix(lower, "/cloudmodel ") {
+			commandFields := strings.Fields(userInput)
+			fields := commandFields[1:]
+			if len(fields) == 0 {
+				fmt.Printf("  %smodel backend: %s\n  cloud provider: %s\n  cloud model: %s\n  cloud endpoint: %s\n  credential configured: %t%s\n",
+					cDim, modelBackend, cloudProvider, cloudModel, cloudBaseURL, strings.TrimSpace(cloudAPIKey) != "", cReset)
+				continue
+			}
+			if len(fields) > 2 || !strings.EqualFold(fields[0], deepSeekProvider) {
+				fmt.Printf("  %sUsage: /cloudmodel deepseek [model]%s\n", cYellow, cReset)
+				continue
+			}
+			selectedCloudModel := cloudModel
+			if selectedCloudModel == "" {
+				selectedCloudModel = deepSeekDefaultModel
+			}
+			if len(fields) == 2 {
+				selectedCloudModel = fields[1]
+			}
+			apiKey, err := readSecret("  DeepSeek API key (blank keeps the saved key): ")
+			if err != nil {
+				fmt.Printf("  %sCould not read DeepSeek API key: %v%s\n", cRed, err, cReset)
+				continue
+			}
+			if strings.TrimSpace(apiKey) == "" {
+				apiKey = cloudAPIKey
+			}
+			if strings.TrimSpace(apiKey) == "" {
+				fmt.Printf("  %sDeepSeek API key is required.%s\n", cRed, cReset)
+				continue
+			}
+			apiKey, repaired, err := normalizeCloudAPIKey(apiKey)
+			if err != nil {
+				fmt.Printf("  %sInvalid DeepSeek API key: %v%s\n", cRed, err, cReset)
+				continue
+			}
+			if err := saveCloudAPIKey(deepSeekProvider, apiKey); err != nil {
+				fmt.Printf("  %sCould not save DeepSeek credential: %v%s\n", cRed, err, cReset)
+				continue
+			}
+			if repaired {
+				fmt.Printf("  %sRemoved terminal paste/control markers from the credential before saving.%s\n", cDim, cReset)
+			}
+			if modelBackend == localModelBackend {
+				localModel = model
+				localOllamaURL = ollamaURL
+			}
+			modelBackend = deepSeekProvider
+			cloudProvider = deepSeekProvider
+			cloudModel = selectedCloudModel
+			cloudBaseURL = deepSeekDefaultBaseURL
+			cloudAPIKey = apiKey
+			model = cloudModel
+			gpus = gpuInfo{}
+			modelMB = 0
+			if strings.TrimSpace(os.Getenv("SECORIZON_NUM_CTX")) == "" {
+				numCtx = deepSeekPromptBudget
+			}
+			fastMode = numCtx <= 32768
+			if err := persistCurrentModelSelection(); err != nil {
+				fmt.Printf("  %sCould not save model selection: %v%s\n", cRed, err, cReset)
+				continue
+			}
+			messages = []message{{Role: "system", Content: messages[0].Content}}
+			updateHistorySnapshot(messages)
+			moduleQueue = nil
+			fmt.Printf("  %sPersistent model backend set to deepseek/%s.%s\n", cGreen, model, cReset)
+			fmt.Printf("  %sContext cleared · active harness budget %dK · provider capability 1M%s\n", cDim, numCtx/1024, cReset)
+			continue
+		}
+
+		if lower == "/localmodel" || strings.HasPrefix(lower, "/localmodel ") {
+			commandFields := strings.Fields(userInput)
+			fields := commandFields[1:]
+			if len(fields) > 1 {
+				fmt.Printf("  %sUsage: /localmodel [model]%s\n", cYellow, cReset)
+				continue
+			}
+			selectedLocalModel := strings.TrimSpace(localModel)
+			if len(fields) == 1 {
+				selectedLocalModel = fields[0]
+			}
+			if selectedLocalModel == "" {
+				selectedLocalModel = "secorizon:v2"
+			}
+			if !ollamaModelExistsAt(localOllamaURL, selectedLocalModel) {
+				fmt.Printf("  %sCan't switch: '%s' is not available from Ollama at %s.%s\n",
+					cRed, selectedLocalModel, localOllamaURL, cReset)
+				continue
+			}
+			modelBackend = localModelBackend
+			localModel = selectedLocalModel
+			model = selectedLocalModel
+			ollamaURL = localOllamaURL
+			remoteOllama = ollamaServerIsRemote(ollamaURL)
+			gpus = gpuInfo{}
+			if !remoteOllama {
+				gpus = detectGPUs()
+			}
+			modelMB = modelDiskSizeMB(model)
+			if err := persistCurrentModelSelection(); err != nil {
+				fmt.Printf("  %sCould not save model selection: %v%s\n", cRed, err, cReset)
+				continue
+			}
+			messages = []message{{Role: "system", Content: messages[0].Content}}
+			updateHistorySnapshot(messages)
+			moduleQueue = nil
+			fmt.Printf("  %sPersistent model backend set to local/%s.%s\n", cGreen, model, cReset)
+			fmt.Printf("  %sContext cleared%s\n", cDim, cReset)
+			continue
+		}
+
 		if strings.HasPrefix(lower, "/model") {
 			parts := strings.Fields(userInput)
 			if len(parts) > 1 {
+				if modelBackend == deepSeekProvider {
+					cloudModel = parts[1]
+					model = cloudModel
+					if err := persistCurrentModelSelection(); err != nil {
+						fmt.Printf("  %sCould not save model selection: %v%s\n", cRed, err, cReset)
+						continue
+					}
+					messages = []message{{Role: "system", Content: messages[0].Content}}
+					updateHistorySnapshot(messages)
+					moduleQueue = nil
+					fmt.Printf("  %sDeepSeek model set to %s.%s\n", cGreen, model, cReset)
+					fmt.Printf("  %sContext cleared%s\n", cDim, cReset)
+					continue
+				}
 				choice := strings.ToLower(parts[1])
 				// Accept both an alias (v2) and a raw Ollama tag.
 				resolved := choice
@@ -5322,6 +6631,14 @@ func main() {
 				}
 				oldModel := model
 				model = resolved
+				localModel = resolved
+				if err := persistCurrentModelSelection(); err != nil {
+					model = oldModel
+					localModel = oldModel
+					fmt.Printf("  %sCould not save model selection: %v%s\n", cRed, err, cReset)
+					continue
+				}
+				modelMB = modelDiskSizeMB(model)
 				// Clear conversation context — previous model's messages don't carry over
 				messages = []message{{Role: "system", Content: messages[0].Content}}
 				updateHistorySnapshot(messages)
@@ -5335,8 +6652,11 @@ func main() {
 				}
 				fmt.Printf("  %sSwitched to %s%s — next message will load it (~10-40s cold).\n", cGreen, model, cReset)
 				fmt.Printf("  %s  Context cleared%s\n", cDim, cReset)
+			} else if modelBackend == deepSeekProvider {
+				fmt.Printf("  %sBackend: deepseek\n  Active: %s\n  Endpoint: %s\n  Credential configured: %t%s\n",
+					cDim, model, cloudBaseURL, strings.TrimSpace(cloudAPIKey) != "", cReset)
 			} else {
-				fmt.Printf("  %sActive: %s%s\n", cDim, model, cReset)
+				fmt.Printf("  %sBackend: local\n  Active: %s\n  Endpoint: %s%s\n", cDim, model, ollamaURL, cReset)
 				for _, name := range mapKeys(models) {
 					tag := models[name]
 					marker := ""
@@ -5355,7 +6675,9 @@ func main() {
 		if lower == "/think" {
 			thinkMode = !thinkMode
 			if thinkMode {
-				if modelEmitsThinkBlocks(model) {
+				if modelBackend == deepSeekProvider {
+					fmt.Printf("  %s%sThink++: ON%s — DeepSeek native thinking enabled on %s\n", cGreen, cBold, cReset, model)
+				} else if modelEmitsThinkBlocks(model) {
 					fmt.Printf("  %s%sThink++: ON%s — native thinking on %s\n", cGreen, cBold, cReset, model)
 				} else {
 					fmt.Printf("  %s%sThink++: ON%s — %s has no native thinking; using prompt-based reasoning instead\n", cYellow, cBold, cReset, model)
@@ -5371,8 +6693,13 @@ func main() {
 		if lower == "/ctx" || strings.HasPrefix(lower, "/ctx ") {
 			arg := strings.TrimSpace(strings.TrimPrefix(userInput, "/ctx"))
 			if arg == "" {
-				fmt.Printf("  %scontext window: %d tokens (%dK)%s — change with /ctx <N> (e.g. /ctx 24k, /ctx 65536, /ctx 250000)\n",
-					cDim, numCtx, numCtx/1024, cReset)
+				if modelBackend == deepSeekProvider {
+					fmt.Printf("  %sactive harness budget: %d tokens (%dK) · DeepSeek capability: 1M%s — change with /ctx <N>\n",
+						cDim, numCtx, numCtx/1024, cReset)
+				} else {
+					fmt.Printf("  %scontext window: %d tokens (%dK)%s — change with /ctx <N> (e.g. /ctx 24k, /ctx 65536, /ctx 250000)\n",
+						cDim, numCtx, numCtx/1024, cReset)
+				}
 				continue
 			}
 			oldCtx := numCtx
@@ -5414,7 +6741,10 @@ func main() {
 					gpuHint = "may span multiple GPUs (slower per-token on consumer cards)"
 				}
 			}
-			if gpuHint != "" {
+			if modelBackend == deepSeekProvider {
+				fmt.Printf("  %s%sactive harness budget: %d tokens (%dK)%s — DeepSeek owns the hosted runtime context\n",
+					cGreen, cBold, numCtx, numCtx/1024, cReset)
+			} else if gpuHint != "" {
 				fmt.Printf("  %s%scontext window: %d tokens (%dK)%s — %s\n",
 					cGreen, cBold, numCtx, numCtx/1024, cReset, gpuHint)
 			} else {
@@ -5423,7 +6753,7 @@ func main() {
 			}
 			// If we shrank context, force-unload the current model so the next
 			// request reloads at the smaller size. Ollama refuses to shrink in-place.
-			if n < oldCtx {
+			if modelBackend == localModelBackend && n < oldCtx {
 				_ = unloadOllamaModel(model)
 				fmt.Printf("  %sunloaded current model — next message will reload at the new size%s\n", cDim, cReset)
 			}
@@ -5434,7 +6764,7 @@ func main() {
 			}
 			estTokens := totalChars / 4
 			if estTokens > numCtx*9/10 {
-				fmt.Printf("  %s⚠ existing context (~%d tokens) is near the new %dK limit — older messages may be silently truncated. Use /clear if needed.%s\n",
+				fmt.Printf("  %s⚠ existing context (~%d tokens) is near the new %dK harness limit — older messages may be truncated. Use /clear if needed.%s\n",
 					cYellow, estTokens, numCtx/1024, cReset)
 			}
 			continue
@@ -5444,17 +6774,30 @@ func main() {
 			fastMode = !fastMode
 			oldCtx := numCtx
 			if fastMode {
-				if gpus.count > 0 && modelMB > 0 {
+				if modelBackend == deepSeekProvider {
+					numCtx = 16384
+					fmt.Printf("  %s%sFast mode: ON%s — %dK active harness budget (DeepSeek runtime context is provider-controlled)\n", cGreen, cBold, cReset, numCtx/1024)
+				} else if gpus.count > 0 && modelMB > 0 {
 					numCtx = recommendCtx(gpus, modelMB)
+					fmt.Printf("  %s%sFast mode: ON%s — %dK context (auto-sized for your GPUs)\n", cGreen, cBold, cReset, numCtx/1024)
 				} else {
 					numCtx = 16384
+					if remoteOllama {
+						fmt.Printf("  %s%sFast mode: ON%s — %dK context (remote GPU capacity is not exposed; override with /ctx <N>)\n", cGreen, cBold, cReset, numCtx/1024)
+					} else {
+						fmt.Printf("  %s%sFast mode: ON%s — %dK context (safe fallback; no local NVIDIA GPU capacity detected)\n", cGreen, cBold, cReset, numCtx/1024)
+					}
 				}
-				fmt.Printf("  %s%sFast mode: ON%s — %dK context (auto-sized for your GPUs)\n", cGreen, cBold, cReset, numCtx/1024)
 			} else {
-				numCtx = 250000
-				fmt.Printf("  %sFast mode: OFF%s — 250K context, full depth (slower per-token; best for code review, deep AD sessions)\n", cDim, cReset)
+				if modelBackend == deepSeekProvider {
+					numCtx = deepSeekPromptBudget
+					fmt.Printf("  %sFast mode: OFF%s — %dK active harness budget · DeepSeek capability 1M\n", cDim, cReset, numCtx/1024)
+				} else {
+					numCtx = 250000
+					fmt.Printf("  %sFast mode: OFF%s — 250K context, full depth (slower per-token; best for code review, deep AD sessions)\n", cDim, cReset)
+				}
 			}
-			if numCtx < oldCtx {
+			if modelBackend == localModelBackend && numCtx < oldCtx {
 				_ = unloadOllamaModel(model)
 				fmt.Printf("  %sunloaded current model — next message will reload at the new size%s\n", cDim, cReset)
 			}
@@ -5466,8 +6809,12 @@ func main() {
 			}
 			estTokens := totalChars / 4
 			if estTokens > numCtx*9/10 {
-				fmt.Printf("  %s⚠ context (~%d tokens) is near the %dK limit — older messages may be silently truncated by Ollama. Use /clear if needed.%s\n",
-					cYellow, estTokens, numCtx/1024, cReset)
+				backendName := "Ollama"
+				if modelBackend == deepSeekProvider {
+					backendName = "the harness budget"
+				}
+				fmt.Printf("  %s⚠ context (~%d tokens) is near the %dK limit — older messages may be truncated by %s. Use /clear if needed.%s\n",
+					cYellow, estTokens, numCtx/1024, backendName, cReset)
 			}
 			continue
 		}
@@ -5751,7 +7098,7 @@ func main() {
 
 		// Regular message to AI — wrap with system reinforcement to prevent safety refusals
 		thinkSuffix := ""
-		if thinkMode {
+		if thinkMode && modelBackend == localModelBackend {
 			thinkSuffix = " Use <think>...</think> tags to show your deep reasoning before your answer."
 		}
 		burpManifest := ""

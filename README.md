@@ -4,7 +4,11 @@
 > https://secorizon.com  
 > twitter.com/secorizon
 
-A terminal-native AI shell built for security professionals. Single Go binary, local model via [Ollama](https://ollama.com), strict JSON tool-use loop, plain-markdown system prompt + methodology guides — and zero patience for cloud-AI condescension about whether you're "authorized."
+A terminal-native AI shell built for security professionals. Single Go binary,
+local model via [Ollama](https://ollama.com) by default, optional DeepSeek V4
+Flash API backend, strict JSON tool-use loop, plain-markdown system prompt +
+methodology guides — and zero patience for cloud-AI condescension about whether
+you're "authorized."
 
 > **Open source ships the shell.** The production system prompt and the
 > methodology playbooks that drive real engagements are the SecorizonAI Pro
@@ -20,7 +24,10 @@ If you've gotten tired of cloud-LLM agents treating every authorized engagement 
 - **The model has shell access.** Commands the AI runs in its tool-use loop run on your machine, in your shell, with your privileges. The agent does the work; it doesn't tell you what to type.
 - **Built-in web search.** When the model needs information it doesn't have — a current CVE, a vendor advisory, a recent writeup — it issues a search query and the results feed back into the next turn. No API keys, no rate limits.
 - **A system prompt + methodology guides** define the agent's identity and workflow. Plain markdown. Edit and restart. The repo ships skeleton examples; the production playbooks (recon, web, code review, exploit dev, AD) are the Pro product. Guides are loaded on-demand at the prompt (`/guides recon`, `/guides web`, …) so cold starts stay snappy and context only grows with what the current task actually needs.
-- **Local-first.** All inference happens on your hardware. No data leaves the box.
+- **Local-first, cloud-optional.** Ollama remains the default and keeps inference
+  on your hardware. `/cloudmodel deepseek` is an explicit opt-in that sends the
+  model conversation—including tool results placed in context—to DeepSeek;
+  `/localmodel` switches persistently back to Ollama.
 
 The default ships with a security-research persona, but the architecture is general — see [docs/custom-ai.md](docs/custom-ai.md) if you want to repurpose for a different domain.
 
@@ -35,6 +42,19 @@ mkdir -p ~/.secorizon && cp SECORIZON.Example.Pentester.md ~/.secorizon/SECORIZO
 SECORIZON_MODEL=<your-model>:tag ./secorizon
 ```
 
+To opt into DeepSeek V4 Flash from the running shell:
+
+```text
+/cloudmodel deepseek deepseek-v4-flash
+# enter the API key at the masked prompt
+/localmodel secorizon:v2                  # switch persistently back to Ollama
+```
+
+Backend/model selection persists in `~/.secorizon/model-settings.json`. The API
+key is isolated in `~/.secorizon/cloud-credentials.json`; both files are private
+mode 0600. `DEEPSEEK_API_KEY` and the other cloud environment variables provide
+temporary overrides without rewriting the saved selection.
+
 For the deeper walkthrough (HuggingFace → Ollama, Modelfile, smoke tests), see [docs/quickstart.md](docs/quickstart.md). For containerized deployment (recommended), see [docker/README.md](docker/README.md).
 
 ---
@@ -44,7 +64,9 @@ For the deeper walkthrough (HuggingFace → Ollama, Modelfile, smoke tests), see
 A session is a back-and-forth: you type, the agent thinks, runs commands, reads output, thinks again. Five runtime behaviors are normal — not errors:
 
 - **`⠋ analyzing...`** — the model is generating its next response between turns. If it spins 2+ minutes on the *first* prompt, the model is cold-loading from disk (per-request `keep_alive: 24h` is already wired in; `OLLAMA_KEEP_ALIVE=24h` on the daemon is belt-and-braces). 2+ minutes on *every* prompt means another client is evicting the model — see the stats line below.
-- **Stats line under every reply** — `[model] tokens | prompt NNNtk/s | gen NN.Ntk/s | total Xs` (and `load X.Xs` only if the model just reloaded). This is your diagnostic when something feels slow: `load X` on every turn = something else is evicting the model (e.g. a parallel Ollama client); `prompt 100tk/s` instead of ~1000 = model is split across GPUs over PCIe.
+- **Stats line under every reply** — Ollama shows `[model] tokens | prompt
+  NNNtk/s | gen NN.Ntk/s | total Xs` (and `load X.Xs` only on reload);
+  DeepSeek shows provider prompt/completion token counts and total time.
 - **`(command backgrounded after 30s)`** — quiet long-running commands (full nmap, deep `find`, recursive `grep`, large `crt.sh` pulls) move to the background after 30s. Combined stdout/stderr is already streaming to a private `/tmp/secorizon_bg_<random>.txt` file when the notice appears, and completion status plus a bounded output preview is automatically delivered to the model on its next turn. `tail -f` the displayed path to watch live.
 - **`Ctrl+C` cancels the current command or model stream — not the shell.** To quit, type `/exit` (saves session history) or hit `Ctrl+D` twice on an empty prompt.
 - **Completed tasks are auto-saved as Markdown reports.** When the model returns
@@ -61,7 +83,7 @@ Full reference in [docs/installation.md § What you'll see during a session](doc
 
 ```
 secorizon/
-├── chat.go                              # The terminal shell — single Go file (~6,100 lines)
+├── chat.go                              # The terminal shell — single Go file (~7,500 lines)
 ├── chat_test.go                         # Parser, runner, persistence, MCP, and lifecycle tests
 ├── go.mod / go.sum                      # Build metadata (one dep: golang.org/x/term)
 ├── SECORIZON.Example.Pentester.md       # EXAMPLE — skeleton pentest system prompt
@@ -129,7 +151,12 @@ The unique combination of **local + shell-execute + pentest-tuned prompt + anti-
 
 ## Two-line summary if you skip the docs
 
-The shell sends your message + system prompt to a local LLM via Ollama. The model responds with structured JSON containing prose for you, and optionally a shell command to run or a web search to perform. The shell executes those, feeds results back, and loops until the model says "done" — then saves the final task report under `~/reports/` and waits for your next message.
+The shell sends your message + system prompt to the selected backend—local
+Ollama by default, or DeepSeek after explicit opt-in. The model responds with
+structured JSON containing prose for you, and optionally a shell command to run
+or a web search to perform. The shell executes those, feeds results back, and
+loops until the model says "done"—then saves the final task report under
+`~/reports/` and waits for your next message.
 
 That's it. It's a terminal-native ReAct loop with a curated system prompt and methodology guides. Everything else is implementation detail.
 

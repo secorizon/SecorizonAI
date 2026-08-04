@@ -135,6 +135,12 @@ OLLAMA_URL=http://gpu-box.local:11434 docker compose run --rm secorizon
 
 Just override the env var.
 
+The banner will not inspect GPUs inside the client container for a remote
+Ollama URL. If the selected model is already warm, it shows the GPU/CPU split
+and model VRAM reported by remote `/api/ps`; otherwise that placement line is
+printed after the first response loads the model. Ollama does not expose the
+remote server's GPU inventory or total VRAM through its public API.
+
 ### Environment variables
 
 All env vars work inside the container — pass them via `docker compose run -e`
@@ -144,6 +150,10 @@ or bake them into the `environment:` block of `docker-compose.yml`:
 |---|---|
 | `OLLAMA_URL` | Where to reach Ollama (default `http://host.docker.internal:11434`) |
 | `SECORIZON_MODEL` | Model tag (Compose default `secorizon:latest`; binary default `secorizon:v2`) |
+| `SECORIZON_MODEL_BACKEND` | Temporary backend override: `local` or `deepseek` |
+| `SECORIZON_CLOUD_MODEL` | DeepSeek model override (default `deepseek-v4-flash`) |
+| `DEEPSEEK_API_KEY` | DeepSeek credential for non-interactive/temporary cloud selection |
+| `DEEPSEEK_BASE_URL` | DeepSeek-compatible HTTPS endpoint (default `https://api.deepseek.com`) |
 | `SECORIZON_NUM_CTX` | Context window in tokens (binary default `250000`). E.g. `SECORIZON_NUM_CTX=16384` for tight VRAM. |
 | `SECORIZON_KEEP_ALIVE` | Per-request keep_alive (default `24h`). Pins the model in VRAM across turns. |
 | `SECORIZON_CONFIG_DIR` | Override `~/.secorizon/` location inside the container. Pre-set to point at the mounted host config. |
@@ -155,6 +165,20 @@ Example one-liner with overrides:
 docker compose run --rm \
   -e SECORIZON_MODEL=secorizon:q5km \
   -e SECORIZON_NUM_CTX=16384 \
+  secorizon
+```
+
+To opt into DeepSeek interactively, run
+`/cloudmodel deepseek deepseek-v4-flash` in the shell; the masked credential and
+persistent backend selection are stored in the mounted
+`./secorizon-config/` directory. In cloud mode,
+conversation context and tool results are sent to DeepSeek, but commands still
+run inside the container. A non-persistent one-liner is:
+
+```bash
+docker compose run --rm \
+  -e SECORIZON_MODEL_BACKEND=deepseek \
+  -e DEEPSEEK_API_KEY='<key>' \
   secorizon
 ```
 
