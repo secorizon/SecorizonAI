@@ -296,6 +296,10 @@ Every session writes:
 - `~/.secorizon/input_history` — your prompts (deduplicated, capped at 1000)
 - `~/reports/<target>.md` — auto-saved audit reports the model emits
 
+Every completed-task report footer includes the elapsed wall-clock time from
+task submission through the final result. This includes model inference,
+commands and searches, network waits, and time awaiting command confirmation.
+
 Tail the conversation transcript while running for debugging:
 
 ```bash

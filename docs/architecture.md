@@ -339,6 +339,10 @@ recent commands stay reachable across sessions.
 Backend selection and cloud credentials live beside that history in separate
 private JSON files; they are configuration state, not part of session replay.
 
+Completed task reports include an elapsed wall-clock duration measured from
+submission of that task turn through its final `status: done` response. For
+`/bymodule`, each unit report records that unit's duration independently.
+
 ## Where to extend
 
 If you want to add new capabilities, here's where to look:
