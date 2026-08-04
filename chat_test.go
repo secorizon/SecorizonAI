@@ -336,6 +336,10 @@ func TestCompletedTaskReportFooterIncludesElapsedWallTime(t *testing.T) {
 			t.Fatalf("report footer omitted %q: %q", want, footer)
 		}
 	}
+	notice := completedTaskReportNotice("/tmp/report.md", 9*time.Minute+17*time.Second)
+	if notice != "[report auto-saved to /tmp/report.md · elapsed 9m 17s]" {
+		t.Fatalf("unexpected terminal report notice: %q", notice)
+	}
 }
 
 func TestRepeatDetectionAndSalvage(t *testing.T) {

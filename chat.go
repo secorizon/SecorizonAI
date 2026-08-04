@@ -3672,6 +3672,11 @@ func completedTaskReportFooter(now time.Time, elapsed time.Duration) string {
 		formatTaskDuration(elapsed), now.Format("2006-01-02 15:04"))
 }
 
+func completedTaskReportNotice(reportFile string, elapsed time.Duration) string {
+	return fmt.Sprintf("[report auto-saved to %s · elapsed %s]",
+		reportFile, formatTaskDuration(elapsed))
+}
+
 // streamRender is a JSON-envelope-aware printer for ollama stream chunks.
 // v2 emits `{"text": "...", "command": "...", "status": "..."}` per turn.
 // We render the `text` field content live (with escape decoding) and hide
@@ -7835,13 +7840,14 @@ func main() {
 					parsedMsg, userInput, isTask, bymoduleAuditTurn, bymoduleLabel,
 				); ok {
 					now := time.Now()
+					elapsed := now.Sub(taskStartedAt)
 					reportDir := expandHome("~/reports")
 					reportFile := nextAvailableReportPath(reportDir, reportName, now)
-					footer := completedTaskReportFooter(now, now.Sub(taskStartedAt))
+					footer := completedTaskReportFooter(now, elapsed)
 					if err := atomicWriteFile(reportFile, []byte(body+footer), 0o600); err != nil {
 						fmt.Printf("\n  %s[report save failed: %s]%s\n", cRed, sanitizeForTerminal(err.Error()), cReset)
 					} else {
-						fmt.Printf("\n  %s[report auto-saved to %s]%s\n", cGreen, reportFile, cReset)
+						fmt.Printf("\n  %s%s%s\n", cGreen, completedTaskReportNotice(reportFile, elapsed), cReset)
 					}
 				}
 			}

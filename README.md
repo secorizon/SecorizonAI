@@ -81,9 +81,10 @@ A session is a back-and-forth: you type, the agent thinks, runs commands, reads 
 - **Completed tasks are auto-saved as Markdown reports.** When the model returns
   `status: done`, the final result is written privately under `~/reports/` and
   the exact path is printed. Existing files are not overwritten; name
-  collisions receive a timestamped filename. Each report records the elapsed
-  wall-clock time from task submission through the completed result. Greetings
-  and clarification questions do not create reports.
+  collisions receive a timestamped filename. The terminal completion notice
+  and report footer both show elapsed wall-clock time from task submission
+  through the completed result. Greetings and clarification questions do not
+  create reports.
 
 Full reference in [docs/installation.md § What you'll see during a session](docs/installation.md#what-youll-see-during-a-session).
 

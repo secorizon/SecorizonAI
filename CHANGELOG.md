@@ -28,8 +28,8 @@ All notable changes to the SecorizonAI shell are documented here.
   Markdown reports are preserved; ordinary final answers receive Task/Result
   sections. Filename collisions get timestamped paths instead of overwriting
   earlier work, and writes use the atomic private-file path. The report footer
-  records end-to-end elapsed wall time, including inference, command/search,
-  network, and confirmation waits.
+  and terminal completion notice record end-to-end elapsed wall time, including
+  inference, command/search, network, and confirmation waits.
 
 - **Harness hardening and regression suite (2026-08-03).** Added focused tests
   for response recovery, repetition handling, command screening, bounded output
