@@ -2,6 +2,82 @@
 
 All notable changes to the SecorizonAI shell are documented here.
 
+## Unreleased
+
+### Added
+
+- **Premature-completion guard for audits (2026-06-10).** The agent loop
+  accepted a `status:done` with no report as a finished audit, so a model
+  that examined one file out of hundreds and declared done returned silently
+  to the prompt. Now, on an audit-intent turn (user asked to audit / hunt
+  vulns / review code) that ran at least one check yet ends with no report,
+  the loop re-prompts the model to keep going or produce a coverage-backed
+  report — up to `maxDoneNudges` (3) times, then accepts the stop so a model
+  that genuinely can't produce one doesn't loop forever. `reportProduced`
+  latches once a real report header appears. Scoped to audit intent so plain
+  command tasks (file listings, single recon commands) are never pushed to
+  write a report; user-directed `question` turns are never overridden. The
+  prior promised-report nudge is folded into this guard (and now bounded).
+  Note: this covers the early-`done` stop path; a model can also stall by
+  narrating intent without emitting a command, which the existing
+  empty-command-streak guard still bounds.
+
+### Fixed
+
+- **Loop salvage no longer re-seeds the loop (2026-06-10).** When
+  `detectRepeatTail` stopped a degenerate generation, `salvageLoopedReport`
+  kept one copy of the looped text and persisted it as the assistant's
+  `done` turn — which then became context for the next prompt, so a
+  follow-up "continue" re-conditioned the model on the exact looped tokens
+  and dropped straight back into the same attractor. Now, when no report
+  header survives the tail-trim, the looped narration is discarded and only
+  a neutral marker is persisted; a genuine report (header present) is still
+  kept and trimmed. Header detection factored into `containsReportHeader`,
+  shared with the agent loop's done-status `hasReport` check.
+
+- **promisesReport self-match false positive (2026-06-10).** A single word
+  could satisfy both sides of the promised-report check — in "technical
+  writeups", verb `write` and object `writeup` matched at the same offset,
+  so an ordinary conversational answer ending in "writeups" triggered the
+  "[You said you'd write a report…]" nudge and the model emitted a blank
+  report template. The object window now starts after the matched verb, so
+  the object must be a separate following word; genuine promises ("let me
+  write the report") still match.
+
+- **Base-family gating for Qwen-specific agent-loop machinery (2026-06-10).**
+  The agent loop's `/no_think` suppression was gated on the model NAME
+  containing "secorizon", but that tag is a brand, not a base —
+  `secorizon-glm47-defi` is GLM-4.7, which doesn't understand Qwen's
+  `/no_think` directive and received it as junk text appended to every
+  command result, driving command-repetition loops in autonomous audits.
+  New `modelFamily()` resolves the true base via ollama `/api/show`
+  `details.family` (cached per session) and `modelEmitsThinkBlocks` now
+  gates on family (`qwen*`/`deepseek*` → think-emitting) instead of name;
+  the name allowlist survives only as a fallback when `/api/show` metadata
+  is unavailable. The JSON-envelope `format:"json"` constraint still
+  applies to all models in the agent loop.
+- **Think-block / JSON-grammar collapse in the agent loop (2026-06-09).**
+  Think-emitting models under `format:"json"` collapsed ~80% of turns to
+  the grammar-minimal `"{}"`, which read as an empty "done" turn and
+  silently dropped `/bymodule` audit units. Fix: append `/no_think` to the
+  final user turn for think-emitting models so grammar and model agree,
+  plus lenient `/bymodule` report auto-save.
+- **Promised-report / silent mid-audit stop (2026-06-07).** An omitted
+  `status` field used to default to `done`, ending the run on harmless
+  preamble turns ("Now let me check..."). Omitted status now biases toward
+  `continue` when the turn carries an action or reads like a continuation,
+  and a model that says `done` while promising a report is nudged to
+  actually emit it.
+- **Em-dash mangling in streamed output (2026-06-06).** The byte-level
+  stream renderer printed multibyte UTF-8 runes via `%c`, turning "—" into
+  "â" + control bytes; raw bytes are now written verbatim.
+- **Empty-output no-progress loop guard (2026-06-02, undocumented in
+  v1.2).** Three consecutive empty command outputs (grep no-match, empty
+  dir) now block the repeated command and inject a strategy-changing
+  nudge; previously the model regenerated the same search verbatim.
+  Anti-loop sampling defaults baked in (`repeat_last_n 2048`,
+  `repeat_penalty 1.1`, `min_p 0.05`; env vars still override).
+
 ## v1.2
 
 The shell grows from a chat-and-execute loop into a security-research workstation:

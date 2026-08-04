@@ -806,6 +806,14 @@ CRITICAL RULES:
 - You don't need permission unless the command is destructive.
 - Be direct, be technical, be helpful. Natural conversation in the "text" field.
 
+## Verify before reporting
+Before you finalize a report or set status "done", RE-CHECK every finding against the actual code — re-read it, do not report from memory of an earlier pass. For EACH finding:
+- Re-open the cited file/lines and confirm the code still says what you claim (right function, right operator, right order of operations).
+- Identify WHO can trigger it and under what trust assumption. An action that only a privileged role (admin / governance / operator / keeper) can take is usually by-design, not a vulnerability — say so and downgrade or drop it.
+- Confirm the impact actually follows. Check whether it is already prevented by: a require/guard on the same path, transaction atomicity (a later revert rolls back earlier writes — so "mint before transfer" is safe if the call reverts as a whole), a bound the caller enforces, a reentrancy guard, or an invariant maintained in another file.
+- Drop findings that do not survive this pass. Assign severity ONLY afterward, and only as high as the trust model and demonstrated impact justify.
+A confident data-flow story is NOT a finding until you have re-verified the guard, the caller's privilege, and that the impact is real.
+
 ## Memory
 Memory is currently disabled.`
 
@@ -1100,7 +1108,8 @@ func (s *scratchpad) digest(unitSrc string) string {
 // model's single-shot report toward two harvestable sections — the harness
 // scrapes them into the scratchpad (ingestReport) instead of relying on the
 // model to call `scratch` verbs mid-audit (which it won't — measured 0/4).
-const bymoduleReportSpec = "\n\nEnd your report with these sections (omit a section only if it is genuinely empty):\n" +
+const bymoduleReportSpec = "\n\nBEFORE writing the report, re-validate each candidate finding against the code: re-read the cited lines, confirm WHO can trigger it (a privileged/governance/operator-only action is usually by-design — downgrade or drop it), and confirm no guard, transaction atomicity, caller-enforced bound, reentrancy guard, or cross-file invariant already prevents the impact. Drop the ones that do not survive; assign severity only after this pass.\n" +
+	"\nEnd your report with these sections (omit a section only if it is genuinely empty):\n" +
 	"## Findings — each CONFIRMED vulnerability as a `### [SEV-NN] <title>` heading (SEV = High/Medium/Low).\n" +
 	"## Carry Forward — a bulleted list of questions this unit could NOT resolve because the answer lives in ANOTHER file (e.g. is this privileged setter guarded elsewhere? is this storage slot initialized by another contract? does a caller enforce the bound this function assumes?). One question per bullet; name the file/symbol to check when you can. Write `- none` if there are genuinely no cross-file questions. These become shared memory for the units audited after this one.\n" +
 	"## Resolved — (only if the OPEN QUESTIONS block above gave you leads this unit answers) `- <Qid> confirmed|refuted: <evidence>` per line."
@@ -2299,9 +2308,214 @@ func parseModelResponse(raw string) ModelResponse {
 	}
 	resp.Text = strings.TrimSpace(resp.Text)
 	if resp.Status == "" {
-		resp.Status = "done"
+		// An omitted status used to default to "done", which silently ended the
+		// turn. That is the "stops for no reason mid-audit" bug: when the model
+		// emits an action-preamble ("Now let me check the nextBasket function.")
+		// but forgets the status/command, defaulting to "done" makes the loop
+		// break (status=="done" is checked before the no-command nudge path).
+		// Bias toward continuing: if the turn carries an action, or reads like a
+		// preamble announcing the next step, treat it as "continue" so the loop
+		// re-prompts. Only fall back to "done" for turns that read like a final
+		// answer (handled elsewhere, incl. the promised-report nudge).
+		switch {
+		case resp.Command != "" || resp.Search != "":
+			resp.Status = "continue"
+		case looksLikeContinuation(resp.Text):
+			resp.Status = "continue"
+		default:
+			resp.Status = "done"
+		}
 	}
 	return resp
+}
+
+// looksLikeContinuation reports whether a no-command turn's text is an
+// investigative preamble ("Now let me check X.", "Let me grep for…", "I'll read
+// the next function.") rather than a finished answer. The model sometimes
+// announces its next step but omits the command in the same turn; treating that
+// as "done" halts the loop prematurely. We bias toward detecting continuation —
+// a false positive costs one extra "[Continue…]" nudge, a false negative
+// silently stops the audit. Report-writing preambles ("let me compile/write the
+// report") are deliberately NOT matched here so they keep flowing to the
+// specialized promised-report handler in the loop.
+func looksLikeContinuation(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if t == "" {
+		return false
+	}
+	// A real final report/answer carries section headers — never nudge those.
+	for _, marker := range []string{
+		"# security", "## findings", "## executive summary",
+		"## recommendations", "## positive observations", "## carry forward",
+	} {
+		if strings.Contains(t, marker) {
+			return false
+		}
+	}
+	// Preambles announce the next step at the end — only inspect the tail to
+	// avoid matching an investigative phrase quoted mid-paragraph in a summary.
+	tail := t
+	if len(tail) > 220 {
+		tail = tail[len(tail)-220:]
+	}
+	// Investigative intent only (check/read/look/grep/etc.) — the generic
+	// "[Continue. Provide your next command]" nudge fits these exactly.
+	for _, p := range []string{
+		"let me check", "let me look", "let me read", "let me find",
+		"let me examine", "let me verify", "let me inspect", "let me trace",
+		"let me grep", "let me search", "let me see", "let me dig",
+		"let's check", "let's look", "let's read", "let's verify",
+		"i'll check", "i'll look", "i'll read", "i'll examine", "i'll verify",
+		"i'll inspect", "i'll trace", "i'll grep", "i'll search",
+		"i need to check", "i need to read", "i need to look",
+		"i should check", "i should look", "next, i'll", "next i'll",
+		"moving on to", "moving to",
+	} {
+		if strings.Contains(tail, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// promisesReport reports whether a no-command, "done"-status turn is merely
+// ANNOUNCING that it will now write the final report (e.g. "Let me now produce
+// the report.", "Let me compile my findings.") rather than actually containing
+// one. Such a turn must be nudged to emit the report instead of silently ending
+// the agent loop. We match a production verb sitting close to a report-ish
+// object so phrasing variants — "produce"/"compile"/"write up", and adverbs
+// wedged in ("let me now produce…", "let me then compile…") — are all caught,
+// where a fixed "let me <verb>" phrase list would miss them. The caller still
+// gates on !hasReport, so an actual report (which quotes such phrases mid-body)
+// is never re-nudged; a rare false positive costs only one extra nudge.
+func promisesReport(text string) bool {
+	t := strings.ToLower(text)
+	// Tail only — a finished report can quote "let me write…" in its prose.
+	if len(t) > 400 {
+		t = t[len(t)-400:]
+	}
+	verbs := []string{
+		"compile", "compiling", "create", "creating", "write", "writing",
+		"write up", "generate", "generating", "produce", "producing",
+		"finalize", "finalizing", "assemble", "assembling", "prepare",
+		"preparing", "put together", "draft", "drafting",
+	}
+	objects := []string{"report", "finding", "audit", "writeup", "write-up", "summary", "analysis"}
+	for _, v := range verbs {
+		i := strings.Index(t, v)
+		if i < 0 {
+			continue
+		}
+		// Window starts AFTER the verb so a single word can't match both sides
+		// of the check against itself ("writeups" = verb "write" + object
+		// "writeup" at the same position — a bio mentioning "technical
+		// writeups" must not read as a promise to write one).
+		win := t[i+len(v):]
+		if len(win) > 60 { // object must follow the verb closely
+			win = win[:60]
+		}
+		for _, o := range objects {
+			if strings.Contains(win, o) {
+				return true
+			}
+		}
+	}
+	// Stock completion announcements that imply a report should follow.
+	for _, p := range []string{
+		"recon complete", "audit complete", "review complete",
+		"final report", "comprehensive report",
+	} {
+		if strings.Contains(t, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectRepeatTail reports whether the tail of s is a block repeated enough
+// times to be a degenerate generation loop rather than legitimately repetitive
+// content. A long block (>=200 chars) repeated twice, or a short block repeated
+// three times, is treated as a loop. Run periodically on the accumulating raw
+// stream (which contains the repeated text verbatim, escaped JSON or not).
+func detectRepeatTail(s string) bool {
+	n := len(s)
+	for L := 24; L <= 2048 && 2*L <= n; L++ {
+		u := s[n-L : n]
+		if len(strings.TrimSpace(u)) < 12 {
+			continue // ignore whitespace/punctuation-only blocks
+		}
+		if s[n-2*L:n-L] != u {
+			continue
+		}
+		if L >= 200 {
+			return true // two copies of a long exact block ⇒ loop
+		}
+		if 3*L <= n && s[n-3*L:n-2*L] == u {
+			return true // three copies of a short block ⇒ loop
+		}
+	}
+	return false
+}
+
+// trimRepeatedTail removes a repeated trailing block, keeping content up to and
+// including the block's FIRST occurrence — so a salvaged report keeps its real
+// content (and one copy of any footer) and drops the looped remainder.
+func trimRepeatedTail(s string) string {
+	n := len(s)
+	for L := 24; L <= 2048 && 2*L <= n; L++ {
+		u := s[n-L : n]
+		if len(strings.TrimSpace(u)) < 12 {
+			continue
+		}
+		if s[n-2*L:n-L] != u {
+			continue
+		}
+		if L >= 200 || (3*L <= n && s[n-3*L:n-2*L] == u) {
+			if i := strings.Index(s, u); i >= 0 {
+				return strings.TrimRight(s[:i+L], " \t\n") + "\n"
+			}
+		}
+	}
+	return s
+}
+
+// salvageLoopedReport turns a looped/partial raw response into a clean, terminal
+// envelope: it recovers the text field (even from truncated JSON), trims the
+// repeated tail, and forces status "done" so the agent loop exits and the
+// report auto-save fires.
+//
+// Re-seed guard: the salvaged turn is appended to `messages` as the assistant's
+// reply, so it becomes context for the NEXT prompt. If the looped text was just
+// narration (no actual report), persisting it verbatim re-conditions the model
+// on the exact tokens it just looped on — and a follow-up "continue" drops
+// straight back into the same attractor. So when no report header survives the
+// trim, we discard the looped narration entirely and persist only a neutral
+// marker. Any real report (header present) is kept and trimmed as before.
+func salvageLoopedReport(raw string) string {
+	pr := parseModelResponse(raw)
+	text := trimRepeatedTail(pr.Text)
+	if !containsReportHeader(text) {
+		text = "[A generation loop was detected and stopped; no report was produced this turn.]"
+	}
+	out, err := json.Marshal(map[string]string{
+		"text":    text,
+		"command": "",
+		"status":  "done",
+	})
+	if err != nil {
+		return raw
+	}
+	return string(out)
+}
+
+// containsReportHeader reports whether s carries one of the report section
+// headers the agent loop treats as a real, savable report. Kept in sync with
+// the inline hasReport check at the loop's done-status handler.
+func containsReportHeader(s string) bool {
+	return strings.Contains(s, "# Security") ||
+		strings.Contains(s, "# Recon") ||
+		strings.Contains(s, "## Findings") ||
+		strings.Contains(s, "## Executive Summary")
 }
 
 // streamRender is a JSON-envelope-aware printer for ollama stream chunks.
@@ -2318,9 +2532,32 @@ type streamRender struct {
 	sawBrace       bool
 	preBraceBytes  int
 	rawMode        bool
+	rawColorOpen   bool
 	anyTextPrinted bool
 	cmdHeaderShown bool
 	cmdBuf         strings.Builder
+}
+
+// writeRaw emits a single byte to stdout verbatim. The state machine walks the
+// stream byte-by-byte, but multibyte UTF-8 runes (e.g. an em dash, E2 80 94)
+// must be written as their original bytes — NOT via fmt's %c, which would treat
+// each byte as a separate U+00xx code point and mangle "—" into "â" + control
+// chars. Structural parsing stays correct because every byte the machine
+// branches on is ASCII (< 0x80), so continuation bytes pass through as content.
+func (s *streamRender) writeRaw(b byte) {
+	os.Stdout.Write([]byte{b})
+}
+
+// writeRawDim is writeRaw for the dim fallback (raw passthrough) mode. It opens
+// the dim color once and leaves it open (reset in finish), rather than wrapping
+// each byte in cDim…cReset — wrapping per byte would inject ANSI escapes
+// between the continuation bytes of a multibyte rune and break decoding.
+func (s *streamRender) writeRawDim(b byte) {
+	if !s.rawColorOpen {
+		fmt.Print(cDim)
+		s.rawColorOpen = true
+	}
+	os.Stdout.Write([]byte{b})
 }
 
 const (
@@ -2350,7 +2587,7 @@ func (s *streamRender) feed(chunk string) {
 	for i := 0; i < len(chunk); i++ {
 		b := chunk[i]
 		if s.rawMode {
-			fmt.Printf("%s%c%s", cDim, b, cReset)
+			s.writeRawDim(b)
 			continue
 		}
 		switch s.state {
@@ -2363,7 +2600,7 @@ func (s *streamRender) feed(chunk string) {
 			s.preBraceBytes++
 			if s.preBraceBytes > fallbackRawCutoff && !s.sawBrace {
 				s.rawMode = true
-				fmt.Printf("%s%c%s", cDim, b, cReset)
+				s.writeRawDim(b)
 			}
 			// Otherwise skip whitespace and noise pre-brace.
 		case srSeekKeyOrEnd:
@@ -2430,7 +2667,7 @@ func (s *streamRender) feed(chunk string) {
 				s.state = srAfterValue
 				continue
 			}
-			fmt.Printf("%c", b)
+			s.writeRaw(b)
 			s.anyTextPrinted = true
 		case srInCommandValue:
 			// Suppress live render — the harness's command formatter prints
@@ -2481,6 +2718,10 @@ func (s *streamRender) feed(chunk string) {
 // finish ends the stream cleanly: prints a trailing newline if any text was
 // emitted, so the next harness output starts on a fresh row.
 func (s *streamRender) finish() {
+	if s.rawColorOpen {
+		fmt.Print(cReset)
+		s.rawColorOpen = false
+	}
 	if s.anyTextPrinted || s.rawMode {
 		fmt.Println()
 	}
@@ -2497,6 +2738,24 @@ type chatChunk struct {
 	EvalDuration       int64 `json:"eval_duration"`
 	LoadDuration       int64 `json:"load_duration"`
 	PromptEvalDuration int64 `json:"prompt_eval_duration"`
+}
+
+// withNoThink returns a shallow copy of messages with Qwen's `/no_think`
+// directive appended to the LAST user turn, suppressing the model's
+// <think>...</think> block. Used only for the JSON-constrained agent loop on
+// think-emitting models, where the think block would otherwise collide with the
+// grammar and collapse the turn to "{}". The original slice is left untouched so
+// saved session history keeps the clean prompt.
+func withNoThink(messages []message) []message {
+	out := make([]message, len(messages))
+	copy(out, messages)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i].Role == "user" {
+			out[i].Content += "\n\n/no_think"
+			break
+		}
+	}
+	return out
 }
 
 func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
@@ -2528,6 +2787,14 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 	opts := map[string]interface{}{
 		"num_ctx":     numCtx,
 		"num_predict": -1, // unlimited; bounded by num_ctx and the agent-loop safeguards
+		// Anti-loop DEFAULTS (env vars below still override). The Modelfile bakes
+		// repeat_last_n=512 — smaller than one report/finding block — so block-level
+		// repetition (duplicated findings, repeated boilerplate footers) escapes the
+		// penalty window and the model loops. Widen the window past a full block and
+		// add min_p to prune the low-probability continuations a loop rides on.
+		"repeat_last_n":  2048,
+		"repeat_penalty": 1.1,
+		"min_p":          0.05,
 	}
 	if v := os.Getenv("SECORIZON_TEMPERATURE"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
@@ -2570,13 +2837,35 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 		// Only set the native-thinking flag when the model actually supports
 		// it; otherwise Ollama 4xx-rejects the request. For models without
 		// the "thinking" capability, the prompt suffix added at the user-input
-		// site still nudges the model to reason out loud.
+		// site still nudges the model to reason out loud. We deliberately do
+		// NOT constrain to JSON here — think-mode wants free-form reasoning.
 		if modelSupportsThinking(model) {
 			t := true
 			payload.Think = &t
 		}
 	} else {
+		// Agent loop (think-mode off): constrain output to the JSON envelope so
+		// the model converges to a structured turn instead of rambling for
+		// dozens of narration turns and never producing a report.
 		payload.Format = json.RawMessage(`"json"`)
+		// BUT: models that emit <think>...</think> as literal completion tokens
+		// (Qwen/DeepSeek bases) collide with the JSON grammar — it forbids the
+		// leading <think> prose, so the constrained decode collapses to the
+		// shortest grammar-valid string "{}" on most turns (~80%+; ~100% for a
+		// bare file-path spec). The loop then reads "{}" as an empty, statusless
+		// turn → defaults to "done" → silently drops the audit unit with no
+		// report. Suppress the think block with Qwen's `/no_think` directive on
+		// the final user turn; the grammar and the model then agree and emit a
+		// clean envelope. Verified: format+/no_think → 0% "{}", format alone →
+		// ~80% "{}". (Removing the grammar entirely instead fixes the collapse
+		// but lets the model ramble — the opposite failure.)
+		// modelEmitsThinkBlocks gates on the BASE FAMILY via /api/show, not the
+		// model name: a non-Qwen base under a secorizon-* tag must NOT receive
+		// /no_think — it's junk text to such models and drove command-repetition
+		// loops in the autonomous loop.
+		if modelEmitsThinkBlocks(model) {
+			payload.Messages = withNoThink(messages)
+		}
 	}
 
 	body, _ := json.Marshal(payload)
@@ -2640,6 +2929,8 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 	spinnerStopped := false
 	firstChunkAt := time.Time{}
 	renderer := &streamRender{}
+	loopHit := false   // set when the model degenerates into block repetition
+	lastLoopCheck := 0 // fullText length at the previous loop-detection scan
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -2667,11 +2958,38 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 			// harness's command renderer prints those in formatted style after
 			// the stream ends, avoiding the previous double-output.
 			renderer.feed(chunk.Message.Content)
+
+			// Backstop for degenerate repetition (the model emitting the same
+			// finding block or boilerplate footer over and over). Sampling
+			// defaults above usually prevent it; this catches the residual cases
+			// so the user doesn't have to Ctrl+C — and, crucially, lets the turn
+			// END cleanly (status done) so the salvaged report still gets saved.
+			if !loopHit && fullText.Len()-lastLoopCheck >= 2048 {
+				lastLoopCheck = fullText.Len()
+				if detectRepeatTail(fullText.String()) {
+					loopHit = true
+					ctxCancel() // stop the model
+					break
+				}
+			}
 		}
 		if chunk.Done {
 			chatResp = chunk
 			break
 		}
+	}
+
+	if loopHit {
+		if spinnerStopped {
+			renderer.finish()
+		} else if len(spinners) > 0 && spinners[0] != nil {
+			spinners[0].finish()
+			spinners[0] = nil
+		}
+		fmt.Printf("\n  %s[repetition detected — generation stopped; salvaging the report]%s\n", cYellow, cReset)
+		// Return as a clean, terminal turn so the agent loop exits and the
+		// report auto-save runs (wasInterrupted=false, not a Ctrl+C abort).
+		return salvageLoopedReport(fullText.String()), false
 	}
 	if err := scanner.Err(); err != nil {
 		if !spinnerStopped && len(spinners) > 0 && spinners[0] != nil {
@@ -2989,18 +3307,63 @@ var (
 	modelThinkCache   = map[string]bool{}
 	modelThinkCacheMu sync.Mutex
 
-	// Substrings (case-insensitive) of model names that emit <think>...</think>
-	// blocks when prompted, even when ollama's /api/show doesn't stamp the
-	// capability (typical for models created via `ollama create -f Modelfile`
-	// from a bf16 GGUF — capability metadata isn't propagated from the base).
-	// Used by modelEmitsThinkBlocks for the UI message only; the API payload
-	// still gates strictly on /api/show via modelSupportsThinking.
+	// FALLBACK ONLY: substrings (case-insensitive) of model names assumed to
+	// emit <think>...</think> blocks when /api/show metadata is unreachable.
+	// The primary gate is modelFamily() — the GGUF architecture — because model
+	// NAMES lie: "secorizon-*" is a brand, not a base, so a brand-tagged model
+	// may be a non-Qwen base that breaks when this substring match feeds it
+	// Qwen's /no_think on every turn. Prefer the family gate; this is a backstop.
 	thinkingNameAllowlist = []string{
 		"qwen3",
 		"secorizon",
 		"deepseek-r1", "r1-distill", "deepseek-reasoner",
 	}
+
+	modelFamilyCache   = map[string]string{}
+	modelFamilyCacheMu sync.Mutex
 )
+
+// modelFamily returns ollama's details.family for the model — the GGUF
+// architecture ("qwen35", "deepseek2", ...) — or "" when
+// /api/show is unreachable or carries no family. This is the ground truth for
+// base-family gating (Qwen-specific machinery like /no_think); never gate that
+// on the model name. Successful lookups are cached for the session; failures
+// are not, so a transient server hiccup doesn't stick.
+func modelFamily(name string) string {
+	modelFamilyCacheMu.Lock()
+	if v, ok := modelFamilyCache[name]; ok {
+		modelFamilyCacheMu.Unlock()
+		return v
+	}
+	modelFamilyCacheMu.Unlock()
+
+	body, _ := json.Marshal(map[string]string{"model": name})
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(ollamaURL+"/api/show", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return ""
+	}
+	var showResp struct {
+		Details struct {
+			Family string `json:"family"`
+		} `json:"details"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&showResp) != nil {
+		return ""
+	}
+	fam := strings.ToLower(strings.TrimSpace(showResp.Details.Family))
+	if fam == "" {
+		return ""
+	}
+	modelFamilyCacheMu.Lock()
+	modelFamilyCache[name] = fam
+	modelFamilyCacheMu.Unlock()
+	return fam
+}
 
 func modelSupportsThinking(name string) bool {
 	modelThinkCacheMu.Lock()
@@ -3039,13 +3402,22 @@ func modelSupportsThinking(name string) bool {
 	return supports
 }
 
-// modelEmitsThinkBlocks — LENIENT: will the model emit <think>...</think>
-// tags when prompted, regardless of ollama's capability advertisement? Used
-// purely for the /think toggle's user-facing message. The API flag still
-// gates on modelSupportsThinking to avoid 4xx errors.
+// modelEmitsThinkBlocks — will the model emit <think>...</think> tags when
+// prompted, regardless of ollama's capability advertisement? Drives the /think
+// toggle's UI message AND the agent loop's decision to append Qwen's /no_think
+// directive (ollamaChat). Gates on the model's base family from /api/show, not
+// its name: Qwen and DeepSeek bases emit think blocks (and Qwen understands
+// /no_think); other bases do not — appending /no_think to a non-think base is
+// junk text on every turn and drove command-repetition loops in the autonomous
+// loop. The name allowlist survives only as a fallback for when /api/show
+// metadata is unavailable. The API think flag still gates strictly on
+// modelSupportsThinking to avoid 4xx errors.
 func modelEmitsThinkBlocks(name string) bool {
 	if modelSupportsThinking(name) {
 		return true
+	}
+	if fam := modelFamily(name); fam != "" {
+		return strings.HasPrefix(fam, "qwen") || strings.HasPrefix(fam, "deepseek")
 	}
 	lowerName := strings.ToLower(name)
 	for _, s := range thinkingNameAllowlist {
@@ -3994,11 +4366,13 @@ func main() {
 		// (rather than a stdin prompt). Used to apply a tighter per-unit tool-call
 		// cap so a runaway agent loop on stub files doesn't grind for minutes.
 		bymoduleAuditTurn := false
+		bymoduleLabel := "" // unit label → stable report filename for the lenient bymodule auto-save
 		if len(moduleQueue) > 0 {
 			// /bymodule: audit the next queued unit with a FRESH context, so a
 			// large codebase never overflows num_ctx and gets silently truncated.
 			unit := moduleQueue[0]
 			moduleQueue = moduleQueue[1:]
+			bymoduleLabel = unit.label
 			// Preserve any loaded methodology guides across the fresh-context reset.
 			// /guides installs guide bodies into messages[0], NOT the systemPrompt
 			// var — so resetting to bare systemPrompt would silently drop them from
@@ -4687,6 +5061,23 @@ func main() {
 		}
 		isTask := !isConversational
 
+		// auditIntent: the user asked for a security audit / vuln hunt / code
+		// review — a task whose deliverable is a written report. Drives the
+		// premature-completion guard below, which rejects a `done` that ends the
+		// audit after only a check or two with no report. Scoped to
+		// assessment-style requests so ordinary command tasks (a file listing, a
+		// single recon command) are never pushed to "produce a report".
+		auditIntent := false
+		for _, kw := range []string{
+			"audit", "vuln", "hunt for", "security review", "code review",
+			"review the code", "review this code", "find bugs", "find security",
+		} {
+			if strings.Contains(inputLower, kw) {
+				auditIntent = true
+				break
+			}
+		}
+
 		// Autonomous command execution loop
 		maxSteps := 500
 		if bymoduleAuditTurn {
@@ -4720,6 +5111,16 @@ func main() {
 		if bymoduleAuditTurn {
 			emptyCmdStreakCap = bymoduleEmptyCmdStreakCap
 		}
+
+		// Premature-completion guard state (audit turns). A model that declares
+		// `done` with no report — or after only a check or two — has not finished
+		// an audit; challenge it up to maxDoneNudges times, then accept the stop
+		// so a model that genuinely can't produce a report doesn't loop forever.
+		// reportProduced latches once a real report header appears, so a later
+		// `done` isn't re-challenged.
+		const maxDoneNudges = 3
+		doneNudges := 0
+		reportProduced := false
 
 		// Context-budget escalation: three one-shot nudges injected as the
 		// running conversation grows. Each fires exactly once per turn-sequence.
@@ -4858,44 +5259,40 @@ func main() {
 							cDim, nq, nf, nr, cReset)
 					}
 				}
-				// If model says "done" but promised a report without actually outputting one, nudge it
-				textLower := strings.ToLower(parsed.Text)
-				promisedReport := strings.Contains(textLower, "let me compile") ||
-					strings.Contains(textLower, "let me create") ||
-					strings.Contains(textLower, "let me write") ||
-					strings.Contains(textLower, "let me generate") ||
-					strings.Contains(textLower, "let me finalize") ||
-					strings.Contains(textLower, "let me put together") ||
-					strings.Contains(textLower, "let me assemble") ||
-					strings.Contains(textLower, "compiling") ||
-					strings.Contains(textLower, "finalize the report") ||
-					strings.Contains(textLower, "finalize the audit") ||
-					strings.Contains(textLower, "finalizing the report") ||
-					strings.Contains(textLower, "generating the report") ||
-					strings.Contains(textLower, "writing the report") ||
-					strings.Contains(textLower, "write up the report") ||
-					strings.Contains(textLower, "prepare the report") ||
-					strings.Contains(textLower, "preparing the report") ||
-					strings.Contains(textLower, "comprehensive report") ||
-					strings.Contains(textLower, "final report") ||
-					strings.Contains(textLower, "recon complete") ||
-					strings.Contains(textLower, "audit complete")
-				hasReport := strings.Contains(parsed.Text, "# Security") ||
-					strings.Contains(parsed.Text, "# Recon") ||
-					strings.Contains(parsed.Text, "## Findings") ||
-					strings.Contains(parsed.Text, "## Executive Summary")
-				if promisedReport && !hasReport {
-					messages = append(messages, message{Role: "user", Content: "[You said you'd write a report but didn't include it. Output the FULL report now in the text field.]"})
-					spin := newSpinner("writing report...")
-					spin.start()
-					messages = drainPendingBgResults(messages)
-					response, wasInterrupted = ollamaChat(messages, spin)
-					if wasInterrupted {
-						aborted = true
-						break
+				hasReport := containsReportHeader(parsed.Text)
+				if hasReport {
+					reportProduced = true
+				}
+				// Premature-completion guard — only for an actual `done` (a
+				// user-directed `question` is the model asking US something; never
+				// override that). Two cases mean "no deliverable yet" and warrant a
+				// re-prompt:
+				//   1. the model ANNOUNCED a report but didn't emit it (promisesReport)
+				//   2. an AUDIT that ran at least one check yet ends with no report
+				//      — i.e. it stopped at the first check (the reported failure).
+				// Re-prompt up to maxDoneNudges times, then accept the stop.
+				if parsed.Status == "done" && !hasReport && !reportProduced && doneNudges < maxDoneNudges {
+					promisedReport := promisesReport(parsed.Text)
+					if promisedReport || (auditIntent && step >= 1) {
+						doneNudges++
+						nudge := "[The audit is NOT complete. You marked it done after examining only part of the scope and produced no report. Do not stop here. Continue systematically — enumerate the in-scope source files, then READ each one and trace data flows from external/untrusted inputs to sensitive sinks; find real candidate issues by reading code, not by grepping for abstract pattern names. Only set status:done together with a full \"# Security Audit Report\" whose \"## Audit Coverage\" section lists the files you actually reviewed. If you genuinely reviewed the whole scope and found nothing, state that explicitly in the report.]"
+						spinMsg := "continuing audit..."
+						if promisedReport {
+							nudge = "[You said you'd write a report but didn't include it. Output the FULL report now in the text field.]"
+							spinMsg = "writing report..."
+						}
+						messages = append(messages, message{Role: "user", Content: nudge})
+						spin := newSpinner(spinMsg)
+						spin.start()
+						messages = drainPendingBgResults(messages)
+						response, wasInterrupted = ollamaChat(messages, spin)
+						if wasInterrupted {
+							aborted = true
+							break
+						}
+						messages = append(messages, message{Role: "assistant", Content: response})
+						continue
 					}
-					messages = append(messages, message{Role: "assistant", Content: response})
-					continue
 				}
 				break
 			}
@@ -5163,12 +5560,32 @@ func main() {
 			if last.Role == "assistant" {
 				parsedMsg := parseModelResponse(last.Content)
 				content := parsedMsg.Text
-				if content != "" &&
+				// Strict report detection for interactive (non-bymodule) audits:
+				// require the canonical heading so we don't save stray analysis.
+				strictReport := content != "" &&
 					(strings.Contains(content, "# Security Audit Report") || strings.Contains(content, "# Recon Report") || strings.Contains(content, "# Security Recon Report")) &&
-					(strings.Contains(content, "## Findings") || strings.Contains(content, "## Executive Summary") || strings.Contains(content, "## Infrastructure")) {
+					(strings.Contains(content, "## Findings") || strings.Contains(content, "## Executive Summary") || strings.Contains(content, "## Infrastructure"))
+				// Lenient path for /bymodule: the unit's final turn IS the report
+				// by construction (the prompt demanded one). With /no_think the
+				// model often drops the exact "# Security Audit Report — <label>"
+				// title yet still emits a correct report ("## Finding — …",
+				// "## Findings — None", a severity block). Strict detection would
+				// silently discard those, so for a completed bymodule unit save
+				// the final text whenever it's substantive, keyed on the known
+				// unit label rather than a parsed heading.
+				bymoduleReport := bymoduleAuditTurn && bymoduleLabel != "" && len(strings.TrimSpace(content)) >= 40
+				if strictReport || bymoduleReport {
 					reportName := "report"
-					if idx := strings.Index(content, "# "); idx >= 0 {
-						line := content[idx+2:]
+					// For a bymodule unit, name the file from the known label using
+					// the SAME "Security Audit Report — <x>" basis as the strict
+					// path, so the filename convention is identical whether or not
+					// /no_think made the model emit the canonical title.
+					titleBasis := content
+					if bymoduleReport {
+						titleBasis = "# Security Audit Report — " + bymoduleLabel
+					}
+					if idx := strings.Index(titleBasis, "# "); idx >= 0 {
+						line := titleBasis[idx+2:]
 						if nl := strings.IndexByte(line, '\n'); nl > 0 {
 							line = line[:nl]
 						}
@@ -5185,12 +5602,19 @@ func main() {
 							reportName = line
 						}
 					}
+					// Normalize: if a bymodule report dropped the canonical title
+					// (terse /no_think output), prepend it so every saved report is
+					// uniform and matches its filename.
+					body := content
+					if bymoduleReport && !strings.Contains(body, "# Security Audit Report") {
+						body = "# Security Audit Report — " + bymoduleLabel + "\n\n" + body
+					}
 					if !savedReports[reportName] {
 						reportDir := expandHome("~/reports")
 						os.MkdirAll(reportDir, 0700)
 						reportFile := filepath.Join(reportDir, reportName+".md")
 						footer := fmt.Sprintf("\n\n---\n*Generated by SecorizonAI — %s*\n", time.Now().Format("2006-01-02 15:04"))
-						if err := os.WriteFile(reportFile, []byte(content+footer), 0600); err == nil {
+						if err := os.WriteFile(reportFile, []byte(body+footer), 0600); err == nil {
 							fmt.Printf("\n  %s[report auto-saved to %s]%s\n", cGreen, reportFile, cReset)
 							savedReports[reportName] = true
 						}
