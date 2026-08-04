@@ -41,12 +41,17 @@ For the deeper walkthrough (HuggingFace → Ollama, Modelfile, smoke tests), see
 
 ## What running the shell looks like
 
-A session is a back-and-forth: you type, the agent thinks, runs commands, reads output, thinks again. Four runtime behaviors are normal — not errors:
+A session is a back-and-forth: you type, the agent thinks, runs commands, reads output, thinks again. Five runtime behaviors are normal — not errors:
 
 - **`⠋ analyzing...`** — the model is generating its next response between turns. If it spins 2+ minutes on the *first* prompt, the model is cold-loading from disk (per-request `keep_alive: 24h` is already wired in; `OLLAMA_KEEP_ALIVE=24h` on the daemon is belt-and-braces). 2+ minutes on *every* prompt means another client is evicting the model — see the stats line below.
 - **Stats line under every reply** — `[model] tokens | prompt NNNtk/s | gen NN.Ntk/s | total Xs` (and `load X.Xs` only if the model just reloaded). This is your diagnostic when something feels slow: `load X` on every turn = something else is evicting the model (e.g. a parallel Ollama client); `prompt 100tk/s` instead of ~1000 = model is split across GPUs over PCIe.
-- **`(command backgrounded after 30s)`** — long-running commands (full nmap, deep `find`, recursive `grep`, large `crt.sh` JSON pulls) move to the background after 30s. The shell saves the eventual output to `/tmp/secorizon_bg_<unix>.txt` AND auto-prepends it to the model's next turn as a `[backgrounded command completed]` user message, so the model can't silently forget the result. `tail -f` from another terminal to watch live.
+- **`(command backgrounded after 30s)`** — quiet long-running commands (full nmap, deep `find`, recursive `grep`, large `crt.sh` pulls) move to the background after 30s. Combined stdout/stderr is already streaming to a private `/tmp/secorizon_bg_<random>.txt` file when the notice appears, and completion status plus a bounded output preview is automatically delivered to the model on its next turn. `tail -f` the displayed path to watch live.
 - **`Ctrl+C` cancels the current command or model stream — not the shell.** To quit, type `/exit` (saves session history) or hit `Ctrl+D` twice on an empty prompt.
+- **Completed tasks are auto-saved as Markdown reports.** When the model returns
+  `status: done`, the final result is written privately under `~/reports/` and
+  the exact path is printed. Existing files are not overwritten; name
+  collisions receive a timestamped filename. Greetings and clarification
+  questions do not create reports.
 
 Full reference in [docs/installation.md § What you'll see during a session](docs/installation.md#what-youll-see-during-a-session).
 
@@ -56,7 +61,8 @@ Full reference in [docs/installation.md § What you'll see during a session](doc
 
 ```
 secorizon/
-├── chat.go                              # The terminal shell — single Go file (~5,200 lines)
+├── chat.go                              # The terminal shell — single Go file (~6,100 lines)
+├── chat_test.go                         # Parser, runner, persistence, MCP, and lifecycle tests
 ├── go.mod / go.sum                      # Build metadata (one dep: golang.org/x/term)
 ├── SECORIZON.Example.Pentester.md       # EXAMPLE — skeleton pentest system prompt
 ├── LICENSE                              # Apache 2.0 + Commons Clause
@@ -123,7 +129,7 @@ The unique combination of **local + shell-execute + pentest-tuned prompt + anti-
 
 ## Two-line summary if you skip the docs
 
-The shell sends your message + system prompt to a local LLM via Ollama. The model responds with structured JSON containing prose for you, and optionally a shell command to run or a web search to perform. The shell executes those, feeds results back, and loops until the model says "done" — then waits for your next message.
+The shell sends your message + system prompt to a local LLM via Ollama. The model responds with structured JSON containing prose for you, and optionally a shell command to run or a web search to perform. The shell executes those, feeds results back, and loops until the model says "done" — then saves the final task report under `~/reports/` and waits for your next message.
 
 That's it. It's a terminal-native ReAct loop with a curated system prompt and methodology guides. Everything else is implementation detail.
 

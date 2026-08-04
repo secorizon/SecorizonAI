@@ -143,8 +143,8 @@ or bake them into the `environment:` block of `docker-compose.yml`:
 | Variable | Purpose |
 |---|---|
 | `OLLAMA_URL` | Where to reach Ollama (default `http://host.docker.internal:11434`) |
-| `SECORIZON_MODEL` | Model tag (default `secorizon:q5km`) |
-| `SECORIZON_NUM_CTX` | Context window in tokens (default `65536`). E.g. `SECORIZON_NUM_CTX=16384` for tight VRAM. |
+| `SECORIZON_MODEL` | Model tag (Compose default `secorizon:latest`; binary default `secorizon:v2`) |
+| `SECORIZON_NUM_CTX` | Context window in tokens (binary default `250000`). E.g. `SECORIZON_NUM_CTX=16384` for tight VRAM. |
 | `SECORIZON_KEEP_ALIVE` | Per-request keep_alive (default `24h`). Pins the model in VRAM across turns. |
 | `SECORIZON_CONFIG_DIR` | Override `~/.secorizon/` location inside the container. Pre-set to point at the mounted host config. |
 | `BURP_MCP_URL` | Default Burp MCP endpoint (only consulted when you run `/burp`). |

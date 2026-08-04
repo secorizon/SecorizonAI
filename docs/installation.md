@@ -24,7 +24,7 @@ shape we maintain at Secorizon and ship as part of the Pro license.
 
 | Component | Why | Where to get it |
 |---|---|---|
-| **Go 1.21+** | Build the binary | https://go.dev/dl/ — or your package manager |
+| **Go 1.25+** | Build the binary and its pinned `x/term` dependency | https://go.dev/dl/ — or your package manager |
 | **Ollama** | Serve the local LLM | https://ollama.com/download |
 | **A model** | The actual brain | `ollama pull <name>` — see [custom-ai.md](custom-ai.md) for picks |
 | **Docker + Compose** | Optional, for containerized deploys | https://docs.docker.com/get-docker/ |
@@ -100,7 +100,7 @@ see [custom-ai.md](custom-ai.md).
 ### Step 4: Run
 
 ```bash
-./secorizon                                       # defaults to model secorizon:q5km, 250K context (fast OFF)
+./secorizon                                       # defaults to model secorizon:v2, 250K context (fast OFF)
 SECORIZON_MODEL=<your-model>:tag ./secorizon      # override the model
 SECORIZON_NUM_CTX=16384 ./secorizon               # override default context window (tokens)
 ```
@@ -110,7 +110,7 @@ You'll see the banner and prompt:
 ```
   SecorizonAI v1.2 — el8 security research AI
   Author: Laurent Gaffie  ·  https://secorizon.com  ·  twitter.com/secorizon
-  model: secorizon:q5km  │  /help for commands
+  model: secorizon:v2  │  /help for commands
   Connected. Type anything. /exit to quit.
   GPU: <auto-detected via nvidia-smi> · <total> GB total
   context: 64K tokens
@@ -229,10 +229,10 @@ big for your VRAM and is partially CPU-offloading. Drop a quantization tier
 ### Stats line — what the numbers mean
 
 ```
-[secorizon:q5km] 5.8k tokens | prompt 994tk/s | gen 30.2tk/s | 9.4s total
+[secorizon:v2] 5.8k tokens | prompt 994tk/s | gen 30.2tk/s | 9.4s total
 ```
 
-- **`[secorizon:q5km]`** — the model that actually served this turn (catches mismatches between `/model` and what's loaded).
+- **`[secorizon:v2]`** — the model that actually served this turn (catches mismatches between `/model` and what's loaded).
 - **`prompt NNNtk/s`** — context evaluation speed. ~1000 = model fits on one GPU. ~100-300 = split across GPUs / partial CPU offload.
 - **`gen NN.Ntk/s`** — generation speed; ceiling depends on model/quant/hardware.
 - **`load X.Xs`** — printed *only* when > 1s. Means the model was unloaded between this turn and the last one. If it shows up every turn, see Troubleshooting.
@@ -243,7 +243,7 @@ A shell command exceeded the 30-second timeout. Rather than block the
 agent loop indefinitely, the shell **moves the command to the background**
 and:
 
-- Saves its output to `/tmp/secorizon_bg_<unix>.txt` once it completes
+- Creates a private `/tmp/secorizon_bg_<random>.txt` before the process starts and streams combined stdout/stderr into it
 - Tells the model "(command backgrounded after 30s)" as the command's "output"
 - Lets the model continue (typically: do something else, then circle back)
 - **Auto-delivers the result when the bg command finishes** — the next time
@@ -255,8 +255,8 @@ and:
   final report. With it, the model is forced to incorporate the findings
   before continuing.
 
-You can `tail -f /tmp/secorizon_bg_*.txt` from another terminal to watch
-the backgrounded job in real time.
+You can `tail -f <the-displayed-path>` from another terminal immediately after
+the background notice to watch the job in real time.
 
 This usually fires on `crt.sh` JSON pulls, full-port nmap, deep `find`
 traversals, recursive `grep` over a large codebase. If you didn't want

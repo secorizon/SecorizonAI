@@ -229,7 +229,7 @@ You should see:
 ```
   SecorizonAI v1.2 — el8 security research AI
   Author: Laurent Gaffie  ·  https://secorizon.com  ·  twitter.com/secorizon
-  model: secorizon:q5km  │  /help for commands
+  model: secorizon:v2  │  /help for commands
   Connected. Type anything. /exit to quit.
   GPU: NVIDIA GeForce RTX 3090 (24GB) + NVIDIA GeForce RTX 3090 (24GB) · 48 GB total
   context: 64K tokens

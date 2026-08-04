@@ -14,7 +14,7 @@ Every knob the shell exposes — environment variables, config files, in-session
 
 | Variable | Default | What it does |
 |---|---|---|
-| `SECORIZON_MODEL` | `secorizon:q5km` | Ollama model tag to use. The default is the q5_k_m quant (~19 GB) which fits a 24 GB GPU comfortably at 64K context (`/fast` or `SECORIZON_NUM_CTX=65536`); the shell's own default is 250K, which on a single 24 GB card wants the fast-mode/override. See [custom-ai.md](custom-ai.md) for tier picks. |
+| `SECORIZON_MODEL` | `secorizon:v2` | Ollama model tag to use. Override it with any installed Ollama tag; see [custom-ai.md](custom-ai.md) for model and quantization guidance. The shell's context default is 250K, so a single 24 GB card generally wants `/fast` or an explicit `SECORIZON_NUM_CTX`. |
 | `SECORIZON_NUM_CTX` | unset (binary default `250000` / 250K) | Context window in tokens. Highest precedence: pinning this at launch overrides the binary default and the `/ctx` runtime command's starting value. Setting it ≤ 32768 also starts the shell in fast mode. |
 | `SECORIZON_KEEP_ALIVE` | `24h` | Sent as the `keep_alive` field in every Ollama chat request. Defends against any client/proxy that defaults to 0 (which would unload the model after every request, paying 30-120s reload cost per turn). |
 | `OLLAMA_URL` | `http://localhost:11434` | Where to reach the Ollama HTTP API. Use `http://host.docker.internal:11434` when running in Docker against host Ollama. Useful when running two Ollama instances on different ports (one per GPU). |
@@ -191,11 +191,11 @@ Created on first run. Holds per-session state:
 
 ```
 ~/.secorizon/
-├── SECORIZON.md         # optional — overrides /opt/secorizon/ if present
-├── guides/              # optional — overrides /opt/secorizon/guides/
+├── SECORIZON.md         # optional — used as primary config, or appended after /opt/secorizon when that exists
+├── guides/              # optional — additional guides; a system guide wins on duplicate filename
 ├── custom-guides/       # add your own guides here; loaded alongside default ones
 ├── guides.aliases       # optional — short names for /guides <name>
-├── history/             # one file per session; `date_HHMM.md` summary
+├── history/             # atomic JSONL checkpoints; `session_YYYYMMDD_HHMMSS.jsonl`
 └── input_history        # last 1000 user inputs (up-arrow recall)
 ```
 
@@ -230,12 +230,12 @@ These are hardcoded but easy to change in `chat.go` if you need to. Search for t
 
 | Setting | Default | Where in chat.go | Why |
 |---|---|---|---|
-| Default model | `secorizon:q5km` | `model = envOr("SECORIZON_MODEL", "secorizon:q5km")` | q5_k_m quant (~19 GB on disk) fits a single 24 GB GPU at moderate contexts. Override with `SECORIZON_MODEL=secorizon:latest` if you have ≥48 GB total VRAM and want full precision. |
+| Default model | `secorizon:v2` | `model = envOr("SECORIZON_MODEL", "secorizon:v2")` | Override with `SECORIZON_MODEL=<installed-tag>` or switch at runtime with `/model`. |
 | Default context | 250,000 tokens (250K) | `numCtx = 250000` (fast mode OFF) | Full-depth context for code-audit / AD-pivot sessions. Spans multiple GPUs on most setups; trade speed for capacity. Override at launch with `SECORIZON_NUM_CTX=16384`, or at runtime with `/ctx 16k`. |
 | Fast-mode context | GPU-auto-sized (16K fallback) | set when `/fast` is toggled ON (`recommendCtx(...)`, else `16384`) | Smaller window for quicker turns; sized from your detected GPU VRAM and the model's on-disk size. |
 | Per-request keep-alive | `24h` | `KeepAlive: envOr("SECORIZON_KEEP_ALIVE", "24h")` | Sent in every chat request to pin the model in VRAM across turns. Avoids the 30-120s reload cost that hits when another client (or a misconfigured Ollama default of 0) evicts the model between messages. |
 | Max autonomous steps | 500 | `maxSteps := 500` | Hard cap on how many command/search turns the agent can run before forced exit. |
-| Per-command timeout | 30 s | `30*time.Second` (in command runner) | Commands taking longer get auto-backgrounded; output saved to `/tmp/secorizon_bg_*.txt`. |
+| Quiet-command background threshold | 30 s | `defaultCommandRunOptions.softTimeout` | A command with no output moves to the background. Combined stdout/stderr is already streaming to the displayed `/tmp/secorizon_bg_*.txt`; the hard timeout remains 5 minutes. |
 | Input buffer | 4 MB | `bufio.NewReaderSize(..., 4*1024*1024)` | Maximum size of a single pasted input. |
 | Input history | 1000 entries | `len(inputHistory) > 1000` | Trimmed on save. |
 
@@ -252,7 +252,8 @@ The shell has several command-line filters baked into chat.go. These are heurist
 | `dangerousSudoTargets` | `sudo apt`, `sudo pip`, `sudo npm`, `sudo go`, etc. | Confirmation prompt |
 | `installerBins` | `pip install`, `npm install`, `apt install`, `cargo install` | Confirmation prompt |
 | `dangerousRmTargets` / `dangerousRmPrefixes` | `rm /`, `rm /home`, `rm /etc/passwd`, etc. — system paths | Confirmation prompt (in addition to the always-confirm `rm` from `dangerousBins`) |
-| `dangerousShells` with `-c` | `bash -c …`, `sh -c …`, etc. — body-as-arg smuggles past per-bin filters | Confirmation prompt |
+| `dangerousShells` with `-c` | `bash -c …`, `sh -c …`, etc. — the body is recursively screened | Confirmation when the body matches |
+| Indirection screening | Newline-separated commands, command/process substitution, common wrappers (`env`, `command`, `timeout`, `nice`, `stdbuf`, `nohup`, `setsid`), inline interpreter code, `eval`/`source`/`xargs` | Recursive screening or conservative confirmation |
 
 All filters funnel through `isDangerous()` → `[dangerous] Run '…'? (y/n)`. On `n`, the command is added to a `blockedCmds` set and the agent is told the user denied it and asked to take a different approach.
 
@@ -264,7 +265,7 @@ These are all in `chat.go` near the top — search for `dangerousBins`, `dangero
 
 Every session writes:
 
-- `~/.secorizon/history/<date>_<time>.md` — full conversation transcript on `/exit`
+- `~/.secorizon/history/session_YYYYMMDD_HHMMSS.jsonl` — atomically replaced conversation checkpoint, updated during the session and on exit
 - `~/.secorizon/input_history` — your prompts (deduplicated, capped at 1000)
 - `~/reports/<target>.md` — auto-saved audit reports the model emits
 

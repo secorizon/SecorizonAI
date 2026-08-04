@@ -60,7 +60,8 @@ How the shell actually works internally. Read this if you want to extend it, deb
 
 ## File breakdown
 
-The whole shell is one file: `chat.go` (~5,200 lines). Sections in declaration order:
+The runtime shell remains one file: `chat.go` (~6,100 lines), with focused
+regression coverage in `chat_test.go`. Runtime sections in declaration order:
 
 Sections, in declaration order (search for each section's leading function or constant to jump to it):
 
@@ -177,12 +178,12 @@ The `format: json` enforcement in the Ollama request (`"format": "json"` in chat
    - Redirect-to-system-paths regex (`> /etc/passwd`, `>> /boot/grub`). Pseudo-devices that are safe write targets (`/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/zero`, `/dev/tty*`, `/dev/fd/*`, `/dev/pts/*`) are explicitly allow-listed so common idioms like `cmd 2>/dev/null` don't trip the alarm. Stderr/fd redirects (`2>`, `&>`) are excluded from this check by the regex prefix.
    - Per-binary danger rules (`rm /`, `dd of=/dev/sda`, `find -delete`, `mkfs.*`, `<pkg> install`, etc.). For `bash -c <body>` invocations, the body is **extracted and recursively passed back to `isDangerous`** rather than always flagged — only the actual contents of the `-c` body decide.
 2. **Confirmation gates** — `[dangerous]` prompts let the user approve or deny each match.
-3. **Spawn** — `exec.CommandContext(ctx, "bash", "-c", cmd)` with a 300s default timeout.
-4. **Capture** — combined stdout+stderr; truncated to prevent runaway logs from blowing the model's context.
+3. **Spawn** — `exec.Command("/bin/bash", "-c", cmd)` in its own process group; soft/hard timers manage backgrounding and termination.
+4. **Capture** — stdout and stderr stream to one private temp file while separate bounded head/tail buffers retain at most 4 MiB total in memory.
 5. **Background fallback** — commands still running after 30s with no partial output are auto-backgrounded. The shell:
-   - Saves output to a unique temp file (`os.CreateTemp("", "secorizon_bg_*.txt")` — O_EXCL + random suffix so an attacker on shared `/tmp` can't pre-symlink it).
+   - Reuses the unique temp file created before process start (`os.CreateTemp("", "secorizon_bg_*.txt")` — O_EXCL + random suffix), so the displayed path is immediately live for `tail -f`.
    - Returns `(command backgrounded after 30s …)` to the model so it can keep working.
-   - **Auto-delivers the result** when the background command finally finishes: a synthetic user-role message is appended to `pendingBgResults`. The next call to `ollamaChat()` runs `drainPendingBgResults()` first, prepending those messages to the model's context. This eliminates the previous failure mode where the model would forget about the backgrounded command entirely and write "results pending" in its final report. Truncated to 8KB inline, with a `cat <file>` pointer to retrieve the rest.
+   - **Auto-delivers every result** when the background command finishes, including stderr-only, empty-output, non-zero-exit, and hard-timeout outcomes. A synthetic user-role message is appended to `pendingBgResults`; the next call to `ollamaChat()` drains it into context. The model copy is capped at 8KB with a pointer to the complete combined stream.
    - Hard timeout (5 min default) kills the bg process and enqueues a `[backgrounded command killed]` notice so the model retries differently instead of waiting forever.
 6. **`cd` handling** — `cd path` and `cd path && cmd` are intercepted; the working directory persists across commands.
 
@@ -280,9 +281,11 @@ These are simple booleans modified in slash-command handlers and read in `ollama
 
 ## Session history
 
-Sessions are isolated. On `/exit`, the entire `messages` slice is serialized
-to `~/.secorizon/history/<date>_<time>.md` for postmortem review — but the
-next session starts fresh from `SECORIZON.md` and does not auto-resume.
+Sessions are isolated. Immutable snapshots of the conversation are serialized
+as JSONL and atomically renamed over
+`~/.secorizon/history/session_YYYYMMDD_HHMMSS.jsonl`; periodic and signal-path
+saves never iterate the live message slice. The next session starts fresh from
+`SECORIZON.md` unless `/resume` is used.
 
 User input history (the up-arrow buffer in the prompt) is persisted to
 `~/.secorizon/input_history` separately and IS loaded back on launch, so

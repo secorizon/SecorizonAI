@@ -6,6 +6,21 @@ All notable changes to the SecorizonAI shell are documented here.
 
 ### Added
 
+- **Report file for every completed task.** Every clean, non-conversational
+  `status: done` turn now writes a private Markdown report under `~/reports`,
+  even when the model omitted canonical security-audit headings. Existing
+  Markdown reports are preserved; ordinary final answers receive Task/Result
+  sections. Filename collisions get timestamped paths instead of overwriting
+  earlier work, and writes use the atomic private-file path.
+
+- **Harness hardening and regression suite (2026-08-03).** Added focused tests
+  for response recovery, repetition handling, command screening, bounded output
+  capture, atomic concurrent checkpoints, background stderr delivery,
+  `/bymodule` report validation, MCP handshake/tool calls, SSE parsing, and
+  Ollama cancellation cleanup. External shell/search/MCP material now carries an
+  explicit untrusted-data envelope and the technical prompt forbids treating
+  instructions found in tool output as commands.
+
 - **Premature-completion guard for audits (2026-06-10).** The agent loop
   accepted a `status:done` with no report as a finished audit, so a model
   that examined one file out of hundreds and declared done returned silently
@@ -23,6 +38,44 @@ All notable changes to the SecorizonAI shell are documented here.
   empty-command-streak guard still bounds.
 
 ### Fixed
+
+- **Hidden internal tool envelopes.** Tool-tuned models occasionally append a
+  `<tool_call>{...}</tool_call>` control object to an otherwise complete report,
+  or copy it into the JSON `text` field. Live rendering and response parsing now
+  suppress that internal envelope while preserving the actual report and its
+  terminal status; raw markdown followed by a tagged control object is also
+  recovered correctly.
+
+- **Stable full dangerous-command confirmation.** The approval prompt now
+  displays the complete sanitized command with readable multiline indentation
+  instead of truncating after the first line or 80 characters. The `(y/n)`
+  label is owned by the raw-line editor, so typing no longer erases it and
+  leaves a bare `y`; confirmation answers also stay out of prompt history.
+
+- **Cancellation lifecycle.** Normal Ollama turns no longer leave one goroutine
+  blocked forever on an unreachable cancellation channel; the SIGINT handler
+  now invokes the active request's context cancel function directly and clears
+  it at turn completion.
+- **Race-free, atomic session persistence.** Signal and periodic savers consume
+  immutable message/input-history snapshots rather than the live slices.
+  Writers are serialized and replace JSONL/history files via same-directory
+  temp files, fsync, and rename, preventing concurrent truncation and partial
+  checkpoints.
+- **Complete bounded background capture.** Command stdout and stderr stream to a
+  private live temp file from process start, while bounded head/tail buffers cap
+  RAM use. Background completion is delivered even for stderr-only, empty,
+  failed, or killed commands, with exit status and a pointer to the full stream.
+- **Command-screening indirection gaps.** Newline-separated commands,
+  command/process substitutions, common execution wrappers, inline interpreter
+  code, and `eval`/`source`/`xargs` now trigger recursive screening or a
+  conservative confirmation.
+- **Burp MCP lifecycle.** The initial SSE endpoint event and response headers
+  have a bounded handshake timeout; connection/tool state is synchronized and
+  pending RPC calls are released when the stream closes.
+- **False `/bymodule` reports.** Headerless unit reports are still supported,
+  but they must now be clean `done` responses with multiple report sections.
+  Questions, parse errors, refusals, and loop-salvage markers are not written as
+  reports or ingested into the scratchpad.
 
 - **Loop salvage no longer re-seeds the loop (2026-06-10).** When
   `detectRepeatTail` stopped a degenerate generation, `salvageLoopedReport`
