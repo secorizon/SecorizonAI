@@ -54,7 +54,7 @@ const (
 	deepSeekDefaultBaseURL = "https://api.deepseek.com"
 	deepSeekDefaultModel   = "deepseek-v4-flash"
 	deepSeekContextTokens  = 1_000_000
-	deepSeekPromptBudget   = 131_072
+	deepSeekPromptBudget   = 250_000
 	modelSettingsVersion   = 1
 )
 
@@ -5962,6 +5962,84 @@ func banner() {
 
 // ── Help ────────────────────────────────────────────────────────────────────
 
+type cliOptions struct {
+	backend string
+	help    bool
+}
+
+func parseCLIOptions(args []string) (cliOptions, error) {
+	var options cliOptions
+	for _, arg := range args {
+		switch arg {
+		case "-h", "--help":
+			options.help = true
+		case "--deepseek":
+			if options.backend == localModelBackend {
+				return cliOptions{}, fmt.Errorf("--deepseek and --local cannot be used together")
+			}
+			options.backend = deepSeekProvider
+		case "--local":
+			if options.backend == deepSeekProvider {
+				return cliOptions{}, fmt.Errorf("--deepseek and --local cannot be used together")
+			}
+			options.backend = localModelBackend
+		default:
+			return cliOptions{}, fmt.Errorf("unknown option %q", arg)
+		}
+	}
+	return options, nil
+}
+
+func printCLIUsage(w io.Writer) {
+	fmt.Fprint(w, `SecorizonAI v1.3 — terminal security research AI
+
+Usage:
+  secorizon [--deepseek | --local]
+  secorizon -h | --help
+
+Backend selection:
+  --deepseek   Use DeepSeek for this run; Ollama is not required.
+               Uses the saved credential, or enter one with /cloudmodel.
+  --local      Use the remembered Ollama model for this run.
+
+With no selector, SecorizonAI uses the persisted backend (Ollama by default).
+/cloudmodel and /localmodel change that persisted selection; startup selectors
+apply only to the current process.
+
+First DeepSeek launch:
+  ./secorizon --deepseek
+  /cloudmodel deepseek deepseek-v4-flash
+
+Environment equivalents:
+  SECORIZON_MODEL_BACKEND=deepseek ./secorizon
+  SECORIZON_MODEL_BACKEND=local ./secorizon
+`)
+}
+
+func applyCLIBackendOverride(backend string) {
+	switch backend {
+	case deepSeekProvider:
+		modelBackend = deepSeekProvider
+		model = cloudModel
+	case localModelBackend:
+		modelBackend = localModelBackend
+		model = localModel
+		ollamaURL = localOllamaURL
+	}
+}
+
+func displayContextK(tokens int) int {
+	if tokens <= 0 {
+		return 0
+	}
+	// Conventional model windows such as 16,384 and 65,536 use binary K;
+	// decimal budgets such as 250,000 should display as the promised 250K.
+	if tokens%1024 == 0 {
+		return tokens / 1024
+	}
+	return (tokens + 500) / 1000
+}
+
 func printHelp() {
 	fmt.Printf(`
 %s%sSecorizonAI Commands%s
@@ -5975,7 +6053,7 @@ func printHelp() {
   %s/localmodel%s [model]          Persistently switch back to Ollama.
   %s/think%s                      Toggle provider-native/prompt-based Think++ reasoning.
   %s/fast%s                       Toggle fast mode. Local: GPU-sized/250K context.
-                              DeepSeek: 16K/128K active harness budget.
+                              DeepSeek: 16K/250K active harness budget.
   %s/ctx%s [N]                    Show or set context window (e.g. /ctx 16k, /ctx 65536, /ctx 250k).
                               Range 2048–1M. Local shrink reloads Ollama; cloud changes the harness budget.
   %s/guides%s [name|all|off]      Load a methodology guide on-demand (off by default).
@@ -6012,6 +6090,17 @@ func printHelp() {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
+	cli, err := parseCLIOptions(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "SecorizonAI: %v\n\n", err)
+		printCLIUsage(os.Stderr)
+		return
+	}
+	if cli.help {
+		printCLIUsage(os.Stdout)
+		return
+	}
+
 	// Load any persisted audit scratchpad (cross-unit memory for /bymodule).
 	scratch.load()
 	// Determine script directory (parent of src/)
@@ -6039,6 +6128,7 @@ func main() {
 		fmt.Printf("  %sModel configuration error: %v%s\n", cRed, err, cReset)
 		return
 	}
+	applyCLIBackendOverride(cli.backend)
 	banner()
 	remoteOllama := ollamaServerIsRemote(ollamaURL)
 	gpus := gpuInfo{}
@@ -6051,81 +6141,96 @@ func main() {
 		resp, err := client.Get(ollamaURL + "/api/tags")
 		if err != nil {
 			fmt.Printf("  %sCannot connect to Ollama: %v%s\n", cRed, err, cReset)
-			fmt.Printf("  %sStart it with: ollama serve%s\n", cDim, cReset)
-			return
-		}
-		defer resp.Body.Close()
-
-		var tagsResp struct {
-			Models []struct {
-				Name string `json:"name"`
-			} `json:"models"`
-		}
-		json.NewDecoder(resp.Body).Decode(&tagsResp)
-		// Normalize: ollama tags always include a tag suffix; if the user passed
-		// "secorizon" (no colon), match it against "secorizon:latest".
-		wantedAlt := model
-		if !strings.Contains(model, ":") {
-			wantedAlt = model + ":latest"
-		}
-		found := false
-		var modelNames []string
-		for _, m := range tagsResp.Models {
-			modelNames = append(modelNames, m.Name)
-			if m.Name == model || m.Name == wantedAlt {
-				found = true
+			fmt.Printf("  %s⚠ No model backend connected; starting the shell anyway.%s\n", cYellow, cReset)
+			fmt.Printf("  %sStart Ollama with 'ollama serve', or select DeepSeek with /cloudmodel deepseek %s.%s\n",
+				cDim, deepSeekDefaultModel, cReset)
+			fmt.Printf("  %sAI turns will fail until a backend is available; /help and !<command> remain usable.%s\n", cDim, cReset)
+			if v := os.Getenv("SECORIZON_NUM_CTX"); v != "" {
+				if n, parseErr := strconv.Atoi(v); parseErr == nil && n >= 2048 {
+					numCtx = n
+				}
 			}
-		}
-		if !found {
-			fmt.Printf("  %sModel '%s' not found in Ollama.%s\n", cRed, model, cReset)
-			fmt.Printf("  %sAvailable: %s%s\n", cDim, strings.Join(modelNames, ", "), cReset)
-			return
-		}
-		fmt.Printf("  %sConnected to Ollama.%s Type anything. /exit to quit.\n", cGreen, cReset)
-
-		// Evict any other model currently warm in VRAM. Otherwise on a system
-		// with OLLAMA_MAX_LOADED_MODELS>=2 you can end up ping-ponging between
-		// our model and someone else's keep-alive'd model.
-		loadedModels := listLoadedModelInfo()
-		for _, other := range loadedModels {
-			if ollamaModelNamesMatch(model, other) {
-				continue
-			}
-			otherName := other.Name
-			if otherName == "" {
-				otherName = other.Model
-			}
-			if otherName == "" {
-				continue
-			}
-			_ = unloadOllamaModel(otherName)
-			fmt.Printf("  %sevicted stale model from VRAM: %s%s\n", cDim, otherName, cReset)
-		}
-
-		remoteOllama = ollamaServerIsRemote(ollamaURL)
-		if !remoteOllama {
-			gpus = detectGPUs()
-		}
-		modelMB = modelDiskSizeMB(model)
-		if v := os.Getenv("SECORIZON_NUM_CTX"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 2048 {
-				numCtx = n
-			}
-		}
-		fastMode = numCtx <= 32768
-
-		if remoteOllama {
-			if info, ok := findLoadedModelInfo(loadedModels, model); ok {
-				fmt.Printf("  %sGPU: %s%s\n", cDim, remoteModelPlacementDescription(info), cReset)
-				markRemotePlacementShown(model)
-			} else {
-				fmt.Printf("  %sGPU: remote Ollama server · model not loaded; placement will be reported after the first response%s\n", cDim, cReset)
-			}
-		} else if gpus.count > 0 {
-			fmt.Printf("  %sGPU: %s · %d GB total%s\n",
-				cDim, strings.Join(gpus.descriptors, " + "), gpus.totalMB/1024, cReset)
+			fastMode = numCtx <= 32768
 		} else {
-			fmt.Printf("  %sGPU: none detected (Ollama may CPU-offload — expect slow inference)%s\n", cYellow, cReset)
+			defer resp.Body.Close()
+
+			var tagsResp struct {
+				Models []struct {
+					Name string `json:"name"`
+				} `json:"models"`
+			}
+			json.NewDecoder(resp.Body).Decode(&tagsResp)
+			// Normalize: ollama tags always include a tag suffix; if the user passed
+			// "secorizon" (no colon), match it against "secorizon:latest".
+			wantedAlt := model
+			if !strings.Contains(model, ":") {
+				wantedAlt = model + ":latest"
+			}
+			found := false
+			var modelNames []string
+			for _, m := range tagsResp.Models {
+				modelNames = append(modelNames, m.Name)
+				if m.Name == model || m.Name == wantedAlt {
+					found = true
+				}
+			}
+			if !found {
+				available := strings.Join(modelNames, ", ")
+				if available == "" {
+					available = "(none)"
+				}
+				fmt.Printf("  %sModel '%s' not found in Ollama.%s\n", cRed, model, cReset)
+				fmt.Printf("  %sAvailable: %s%s\n", cDim, available, cReset)
+				fmt.Printf("  %s⚠ No model backend connected; starting the shell anyway.%s\n", cYellow, cReset)
+				fmt.Printf("  %sUse /model, /cloudmodel, or !ollama pull <model> to configure one.%s\n", cDim, cReset)
+			} else {
+				fmt.Printf("  %sConnected to Ollama.%s Type anything. /exit to quit.\n", cGreen, cReset)
+
+				// Evict any other model currently warm in VRAM. Otherwise on a system
+				// with OLLAMA_MAX_LOADED_MODELS>=2 you can end up ping-ponging between
+				// our model and someone else's keep-alive'd model.
+				loadedModels := listLoadedModelInfo()
+				for _, other := range loadedModels {
+					if ollamaModelNamesMatch(model, other) {
+						continue
+					}
+					otherName := other.Name
+					if otherName == "" {
+						otherName = other.Model
+					}
+					if otherName == "" {
+						continue
+					}
+					_ = unloadOllamaModel(otherName)
+					fmt.Printf("  %sevicted stale model from VRAM: %s%s\n", cDim, otherName, cReset)
+				}
+
+				remoteOllama = ollamaServerIsRemote(ollamaURL)
+				if !remoteOllama {
+					gpus = detectGPUs()
+				}
+				modelMB = modelDiskSizeMB(model)
+				if v := os.Getenv("SECORIZON_NUM_CTX"); v != "" {
+					if n, err := strconv.Atoi(v); err == nil && n >= 2048 {
+						numCtx = n
+					}
+				}
+				fastMode = numCtx <= 32768
+
+				if remoteOllama {
+					if info, ok := findLoadedModelInfo(loadedModels, model); ok {
+						fmt.Printf("  %sGPU: %s%s\n", cDim, remoteModelPlacementDescription(info), cReset)
+						markRemotePlacementShown(model)
+					} else {
+						fmt.Printf("  %sGPU: remote Ollama server · model not loaded; placement will be reported after the first response%s\n", cDim, cReset)
+					}
+				} else if gpus.count > 0 {
+					fmt.Printf("  %sGPU: %s · %d GB total%s\n",
+						cDim, strings.Join(gpus.descriptors, " + "), gpus.totalMB/1024, cReset)
+				} else {
+					fmt.Printf("  %sGPU: none detected (Ollama may CPU-offload — expect slow inference)%s\n", cYellow, cReset)
+				}
+			}
 		}
 	} else {
 		fmt.Printf("  %sDeepSeek backend selected.%s Type anything. /exit to quit.\n", cGreen, cReset)
@@ -6142,7 +6247,7 @@ func main() {
 			numCtx = deepSeekPromptBudget
 		}
 		fastMode = numCtx <= 32768
-		fmt.Printf("  %scloud context: provider capability 1M · active harness budget %dK%s\n", cDim, numCtx/1024, cReset)
+		fmt.Printf("  %scloud context: provider capability 1M · active harness budget %dK%s\n", cDim, displayContextK(numCtx), cReset)
 	}
 
 	// Clean up stale temp files from previous sessions for either backend.
@@ -6151,7 +6256,7 @@ func main() {
 		_ = os.Remove(f)
 	}
 	if modelBackend == localModelBackend {
-		fmt.Printf("  %scontext: %dK tokens%s\n", cDim, numCtx/1024, cReset)
+		fmt.Printf("  %scontext: %dK tokens%s\n", cDim, displayContextK(numCtx), cReset)
 	}
 
 	// Burp MCP — created but NOT connected. User opts in via /burp.
@@ -6557,7 +6662,7 @@ func main() {
 			updateHistorySnapshot(messages)
 			moduleQueue = nil
 			fmt.Printf("  %sPersistent model backend set to deepseek/%s.%s\n", cGreen, model, cReset)
-			fmt.Printf("  %sContext cleared · active harness budget %dK · provider capability 1M%s\n", cDim, numCtx/1024, cReset)
+			fmt.Printf("  %sContext cleared · active harness budget %dK · provider capability 1M%s\n", cDim, displayContextK(numCtx), cReset)
 			continue
 		}
 
@@ -6695,10 +6800,10 @@ func main() {
 			if arg == "" {
 				if modelBackend == deepSeekProvider {
 					fmt.Printf("  %sactive harness budget: %d tokens (%dK) · DeepSeek capability: 1M%s — change with /ctx <N>\n",
-						cDim, numCtx, numCtx/1024, cReset)
+						cDim, numCtx, displayContextK(numCtx), cReset)
 				} else {
 					fmt.Printf("  %scontext window: %d tokens (%dK)%s — change with /ctx <N> (e.g. /ctx 24k, /ctx 65536, /ctx 250000)\n",
-						cDim, numCtx, numCtx/1024, cReset)
+						cDim, numCtx, displayContextK(numCtx), cReset)
 				}
 				continue
 			}
@@ -6743,13 +6848,13 @@ func main() {
 			}
 			if modelBackend == deepSeekProvider {
 				fmt.Printf("  %s%sactive harness budget: %d tokens (%dK)%s — DeepSeek owns the hosted runtime context\n",
-					cGreen, cBold, numCtx, numCtx/1024, cReset)
+					cGreen, cBold, numCtx, displayContextK(numCtx), cReset)
 			} else if gpuHint != "" {
 				fmt.Printf("  %s%scontext window: %d tokens (%dK)%s — %s\n",
-					cGreen, cBold, numCtx, numCtx/1024, cReset, gpuHint)
+					cGreen, cBold, numCtx, displayContextK(numCtx), cReset, gpuHint)
 			} else {
 				fmt.Printf("  %s%scontext window: %d tokens (%dK)%s\n",
-					cGreen, cBold, numCtx, numCtx/1024, cReset)
+					cGreen, cBold, numCtx, displayContextK(numCtx), cReset)
 			}
 			// If we shrank context, force-unload the current model so the next
 			// request reloads at the smaller size. Ollama refuses to shrink in-place.
@@ -6765,7 +6870,7 @@ func main() {
 			estTokens := totalChars / 4
 			if estTokens > numCtx*9/10 {
 				fmt.Printf("  %s⚠ existing context (~%d tokens) is near the new %dK harness limit — older messages may be truncated. Use /clear if needed.%s\n",
-					cYellow, estTokens, numCtx/1024, cReset)
+					cYellow, estTokens, displayContextK(numCtx), cReset)
 			}
 			continue
 		}
@@ -6776,22 +6881,22 @@ func main() {
 			if fastMode {
 				if modelBackend == deepSeekProvider {
 					numCtx = 16384
-					fmt.Printf("  %s%sFast mode: ON%s — %dK active harness budget (DeepSeek runtime context is provider-controlled)\n", cGreen, cBold, cReset, numCtx/1024)
+					fmt.Printf("  %s%sFast mode: ON%s — %dK active harness budget (DeepSeek runtime context is provider-controlled)\n", cGreen, cBold, cReset, displayContextK(numCtx))
 				} else if gpus.count > 0 && modelMB > 0 {
 					numCtx = recommendCtx(gpus, modelMB)
-					fmt.Printf("  %s%sFast mode: ON%s — %dK context (auto-sized for your GPUs)\n", cGreen, cBold, cReset, numCtx/1024)
+					fmt.Printf("  %s%sFast mode: ON%s — %dK context (auto-sized for your GPUs)\n", cGreen, cBold, cReset, displayContextK(numCtx))
 				} else {
 					numCtx = 16384
 					if remoteOllama {
-						fmt.Printf("  %s%sFast mode: ON%s — %dK context (remote GPU capacity is not exposed; override with /ctx <N>)\n", cGreen, cBold, cReset, numCtx/1024)
+						fmt.Printf("  %s%sFast mode: ON%s — %dK context (remote GPU capacity is not exposed; override with /ctx <N>)\n", cGreen, cBold, cReset, displayContextK(numCtx))
 					} else {
-						fmt.Printf("  %s%sFast mode: ON%s — %dK context (safe fallback; no local NVIDIA GPU capacity detected)\n", cGreen, cBold, cReset, numCtx/1024)
+						fmt.Printf("  %s%sFast mode: ON%s — %dK context (safe fallback; no local NVIDIA GPU capacity detected)\n", cGreen, cBold, cReset, displayContextK(numCtx))
 					}
 				}
 			} else {
 				if modelBackend == deepSeekProvider {
 					numCtx = deepSeekPromptBudget
-					fmt.Printf("  %sFast mode: OFF%s — %dK active harness budget · DeepSeek capability 1M\n", cDim, cReset, numCtx/1024)
+					fmt.Printf("  %sFast mode: OFF%s — %dK active harness budget · DeepSeek capability 1M\n", cDim, cReset, displayContextK(numCtx))
 				} else {
 					numCtx = 250000
 					fmt.Printf("  %sFast mode: OFF%s — 250K context, full depth (slower per-token; best for code review, deep AD sessions)\n", cDim, cReset)
@@ -6814,7 +6919,7 @@ func main() {
 					backendName = "the harness budget"
 				}
 				fmt.Printf("  %s⚠ context (~%d tokens) is near the %dK limit — older messages may be truncated by %s. Use /clear if needed.%s\n",
-					cYellow, estTokens, numCtx/1024, backendName, cReset)
+					cYellow, estTokens, displayContextK(numCtx), backendName, cReset)
 			}
 			continue
 		}
@@ -6902,7 +7007,7 @@ func main() {
 							"%s%s%s: %d files / %d LOC / ~%dK tokens > %dK budget (%d%% of %dK numCtx)",
 							cBold, units[i].label, cReset,
 							n, loc, estTokens/1000, tokenBudget/1000,
-							inlineTokenBudgetPct, numCtx/1024))
+							inlineTokenBudgetPct, displayContextK(numCtx)))
 					}
 					units[i].spec = content
 					units[i].inlined = true
@@ -7330,7 +7435,7 @@ func main() {
 					messages = append(messages, message{Role: "user", Content: nudge})
 					col := cRed
 					fmt.Printf("  %s[ctx HARD STOP · ~%dK / %dK numCtx (%d%%%s)]%s\n",
-						col, estTokens/1000, numCtx/1024, actualPct, overflowTag, cReset)
+						col, estTokens/1000, displayContextK(numCtx), actualPct, overflowTag, cReset)
 				} else if !ctxWrapUpFired && estTokens > numCtx*ctxWrapUpPct/100 {
 					// 70% — wrap-up.
 					ctxWrapUpFired = true
@@ -7352,7 +7457,7 @@ func main() {
 					}
 					messages = append(messages, message{Role: "user", Content: nudge})
 					fmt.Printf("  %s[ctx wrap-up · ~%dK / %dK numCtx (%d%%)]%s\n",
-						cYellow, estTokens/1000, numCtx/1024, actualPct, cReset)
+						cYellow, estTokens/1000, displayContextK(numCtx), actualPct, cReset)
 				} else if !ctxHeadsUpFired && estTokens > numCtx*ctxHeadsUpPct/100 {
 					// 60% — heads-up. Awareness only, no behavioral demand.
 					ctxHeadsUpFired = true
@@ -7363,7 +7468,7 @@ func main() {
 						actualPct, estTokens, numCtx)
 					messages = append(messages, message{Role: "user", Content: nudge})
 					fmt.Printf("  %s[ctx heads-up · ~%dK / %dK numCtx (%d%%)]%s\n",
-						cDim, estTokens/1000, numCtx/1024, actualPct, cReset)
+						cDim, estTokens/1000, displayContextK(numCtx), actualPct, cReset)
 				}
 			}
 			parsed := parseModelResponse(response)

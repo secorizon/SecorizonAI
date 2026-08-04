@@ -226,8 +226,8 @@ shape we maintain at Secorizon and ship as part of the Pro license.
 
 ## Troubleshooting
 
-**`Cannot connect to Ollama`** — check that Ollama is reachable from inside
-the container:
+**`Cannot connect to Ollama`** — the harness remains open in disconnected mode.
+Check that Ollama is reachable from inside the container:
 ```bash
 docker compose run --rm --entrypoint curl secorizon http://host.docker.internal:11434/api/tags
 ```

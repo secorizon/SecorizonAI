@@ -23,6 +23,59 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
 	return fn(request)
 }
 
+func TestParseCLIOptions(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantBackend string
+		wantHelp    bool
+		wantError   bool
+	}{
+		{name: "defaults", args: nil},
+		{name: "short help", args: []string{"-h"}, wantHelp: true},
+		{name: "long help", args: []string{"--help"}, wantHelp: true},
+		{name: "deepseek", args: []string{"--deepseek"}, wantBackend: deepSeekProvider},
+		{name: "local", args: []string{"--local"}, wantBackend: localModelBackend},
+		{name: "conflict", args: []string{"--deepseek", "--local"}, wantError: true},
+		{name: "unknown", args: []string{"--wat"}, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCLIOptions(test.args)
+			if (err != nil) != test.wantError {
+				t.Fatalf("parseCLIOptions(%q) error = %v", test.args, err)
+			}
+			if got.backend != test.wantBackend || got.help != test.wantHelp {
+				t.Fatalf("parseCLIOptions(%q) = %#v", test.args, got)
+			}
+		})
+	}
+}
+
+func TestCLIUsageExplainsOfflineDeepSeekStartup(t *testing.T) {
+	var output strings.Builder
+	printCLIUsage(&output)
+	for _, want := range []string{"--deepseek", "Ollama is not required", "/cloudmodel deepseek", "SECORIZON_MODEL_BACKEND=deepseek"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("CLI usage omitted %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestDisplayContextKPreservesDecimalAndBinaryBudgets(t *testing.T) {
+	tests := map[int]int{
+		16_384:  16,
+		65_536:  64,
+		131_072: 128,
+		250_000: 250,
+	}
+	for tokens, want := range tests {
+		if got := displayContextK(tokens); got != want {
+			t.Fatalf("displayContextK(%d) = %d, want %d", tokens, got, want)
+		}
+	}
+}
+
 func TestRenderEditableInputShowsLongPasteAsReadableBlock(t *testing.T) {
 	prompt := "\x1b[96myou>\x1b[0m "
 	raw := strings.Repeat("abcdefghij", 30)

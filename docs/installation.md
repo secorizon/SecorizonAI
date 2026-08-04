@@ -128,8 +128,10 @@ API does not expose remote GPU names, count, or total capacity, so those values
 cannot be shown or used for automatic context sizing. A local non-NVIDIA or
 CPU-only setup still shows `GPU: none detected` and remains usable.
 
-If you see "Cannot connect to Ollama" — make sure `ollama serve` is running
-and `OLLAMA_URL` (default `http://localhost:11434`) is reachable.
+If you see "Cannot connect to Ollama", the harness now warns and continues to
+the interactive prompt in disconnected mode. Start `ollama serve`, correct
+`OLLAMA_URL`, run `/cloudmodel`, or continue using `/help` and direct
+`!<command>` execution while no AI backend is connected.
 
 ### Optional: use DeepSeek V4 Flash
 
@@ -141,9 +143,10 @@ running shell:
 # enter the API key at the masked prompt
 ```
 
-If this is the first launch and no Ollama daemon is available, start once with
-`SECORIZON_MODEL_BACKEND=deepseek ./secorizon`; then run `/cloudmodel` above.
-That avoids putting the API key in shell history.
+If this is the first launch and no Ollama daemon is available, use
+`./secorizon --deepseek`; then run `/cloudmodel` above. That avoids putting the
+API key in shell history. `./secorizon -h` lists the temporary `--deepseek` and
+`--local` startup selectors.
 
 The switch is persistent and clears the current conversation context. It does
 not require Ollama to be running on later launches. While DeepSeek is active,
@@ -167,7 +170,7 @@ SECORIZON_CLOUD_MODEL=deepseek-v4-flash \
 DEEPSEEK_API_KEY='<key>' ./secorizon
 ```
 
-DeepSeek mode defaults to a 128K active harness budget within the provider's
+DeepSeek mode defaults to a 250K active harness budget within the provider's
 1M model capability. `/ctx` changes the harness budget only; `/think` controls
 DeepSeek's native thinking mode. `DEEPSEEK_BASE_URL` may override the endpoint,
 but it must be an absolute HTTPS URL.
@@ -328,10 +331,14 @@ twice on an empty prompt. The startup banner says this explicitly.
 ## Troubleshooting
 
 **`Cannot connect to Ollama`**
-`ollama serve` isn't running, or `OLLAMA_URL` is wrong. Verify with `curl $OLLAMA_URL/api/tags`.
+`ollama serve` isn't running, or `OLLAMA_URL` is wrong. The shell remains open
+in disconnected mode. Verify with `curl $OLLAMA_URL/api/tags`, start Ollama,
+or switch from the prompt with `/cloudmodel deepseek deepseek-v4-flash`.
 
 **`Model 'my-agent' not found in Ollama`**
-`ollama list` doesn't show it — either the `ollama create` step failed, or `SECORIZON_MODEL` has a typo. Tags are case-sensitive.
+`ollama list` doesn't show it — either the `ollama create` step failed, or
+`SECORIZON_MODEL` has a typo. Tags are case-sensitive. The shell remains open
+so `/model`, `/cloudmodel`, and `!ollama pull <model>` can fix the selection.
 
 **Garbled output / model talks but never runs commands**
 The model isn't producing valid JSON. Try a bigger model, or read [custom-ai.md § "What 'good enough' means"](custom-ai.md#what-good-enough-means) for diagnosis.

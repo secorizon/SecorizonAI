@@ -42,7 +42,12 @@ mkdir -p ~/.secorizon && cp SECORIZON.Example.Pentester.md ~/.secorizon/SECORIZO
 SECORIZON_MODEL=<your-model>:tag ./secorizon
 ```
 
-To opt into DeepSeek V4 Flash from the running shell:
+To launch directly with DeepSeek—without requiring Ollama—and persist the
+selection from the running shell:
+
+```bash
+./secorizon --deepseek
+```
 
 ```text
 /cloudmodel deepseek deepseek-v4-flash
@@ -54,6 +59,10 @@ Backend/model selection persists in `~/.secorizon/model-settings.json`. The API
 key is isolated in `~/.secorizon/cloud-credentials.json`; both files are private
 mode 0600. `DEEPSEEK_API_KEY` and the other cloud environment variables provide
 temporary overrides without rewriting the saved selection.
+`./secorizon -h` documents the temporary `--deepseek` and `--local` startup
+selectors. If the selected Ollama server or model is unavailable, the harness
+now starts in disconnected mode so `/cloudmodel`, `/help`, and `!<command>`
+remain usable.
 
 For the deeper walkthrough (HuggingFace → Ollama, Modelfile, smoke tests), see [docs/quickstart.md](docs/quickstart.md). For containerized deployment (recommended), see [docker/README.md](docker/README.md).
 

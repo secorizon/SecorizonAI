@@ -15,6 +15,13 @@ All notable changes to the SecorizonAI shell are documented here.
   non-persistent environment overrides. Ollama remains the default, and cloud
   mode does not require a reachable Ollama server or local GPU.
 
+- **Backend-aware startup.** `-h`/`--help` now prints command-line usage without
+  initializing a model, while `--deepseek` and `--local` select a backend for
+  the current process. An unavailable Ollama server or model now starts the
+  interactive shell in a clearly warned disconnected mode instead of exiting,
+  keeping `/cloudmodel`, `/help`, and direct commands available. DeepSeek's
+  default active harness budget is now 250K within its 1M provider capability.
+
 - **Report file for every completed task.** Every clean, non-conversational
   `status: done` turn now writes a private Markdown report under `~/reports`,
   even when the model omitted canonical security-audit headings. Existing

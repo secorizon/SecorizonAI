@@ -47,7 +47,7 @@ select DeepSeek from the prompt:
 
 ```bash
 go build -o secorizon ./chat.go
-SECORIZON_MODEL_BACKEND=deepseek ./secorizon
+./secorizon --deepseek
 ```
 
 ```text
