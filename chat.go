@@ -1912,6 +1912,93 @@ func expandHome(p string) string {
 // include credentials.
 func mkdirPrivate(p string) { os.MkdirAll(p, 0700) }
 
+// initializeUserGuideDirs creates the writable guide locations advertised by
+// /help and the documentation. The system-wide /opt/secorizon/guides path is
+// deliberately discovery-only because an unprivileged first run cannot create
+// it. A configured state directory gets its own guides directory as well.
+func initializeUserGuideDirs() {
+	dirs := []string{
+		expandHome("~/.secorizon/guides"),
+		expandHome("~/.secorizon/custom-guides"),
+	}
+	if configDir := strings.TrimSpace(os.Getenv("SECORIZON_CONFIG_DIR")); configDir != "" {
+		dirs = append(dirs, filepath.Join(expandHome(configDir), "guides"))
+	}
+
+	seen := make(map[string]bool, len(dirs))
+	for _, dir := range dirs {
+		dir = filepath.Clean(dir)
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		mkdirPrivate(dir)
+	}
+}
+
+func guideCommandName(filename string) string {
+	return strings.ToLower(strings.TrimSuffix(filename, ".md"))
+}
+
+// availableGuideNames returns exactly what users can type after /guides.
+// It is derived from files that were actually discovered, never from the
+// built-in compatibility aliases.
+func availableGuideNames(guides map[string]string) []string {
+	names := make([]string, 0, len(guides))
+	for filename := range guides {
+		names = append(names, guideCommandName(filename))
+	}
+	sort.Strings(names)
+	return names
+}
+
+// addDiscoveredGuideAliases makes every filename stem directly addressable.
+// Exact stems take precedence over compatibility aliases: when recon.md is
+// present, /guides recon must load it rather than recon-external.md.
+func addDiscoveredGuideAliases(guides, aliases map[string]string) {
+	filenames := make([]string, 0, len(guides))
+	exactStems := make(map[string]bool, len(guides))
+	for filename := range guides {
+		filenames = append(filenames, filename)
+		exactStems[guideCommandName(filename)] = true
+	}
+	sort.Strings(filenames)
+
+	for _, filename := range filenames {
+		aliases[guideCommandName(filename)] = filename
+	}
+	for _, filename := range filenames {
+		stem := guideCommandName(filename)
+		if i := strings.Index(stem, "-"); i > 0 {
+			short := stem[:i]
+			if exactStems[short] {
+				continue
+			}
+			if _, taken := aliases[short]; !taken {
+				aliases[short] = filename
+			}
+		}
+	}
+}
+
+func resolveGuideName(arg string, guides, aliases map[string]string) (string, bool) {
+	arg = strings.ToLower(strings.TrimSpace(arg))
+	for filename := range guides {
+		if guideCommandName(filename) == arg {
+			return filename, true
+		}
+	}
+	if _, exists := guides[arg]; exists {
+		return arg, true
+	}
+	filename, ok := aliases[arg]
+	if !ok {
+		return "", false
+	}
+	_, exists := guides[filename]
+	return filename, exists
+}
+
 type persistedModelSettings struct {
 	Version       int    `json:"version"`
 	Backend       string `json:"backend"`
@@ -6145,6 +6232,7 @@ func main() {
 
 	mkdirPrivate(historyDir)
 	mkdirPrivate(filepath.Dir(inputHist))
+	initializeUserGuideDirs()
 
 	loadInputHistory()
 
@@ -6331,21 +6419,8 @@ func main() {
 	// Snapshot system prompt before any guide injection (for clean strip/reload)
 	originalSystemPrompt = systemPrompt
 
-	// Layer 2: auto-derive aliases from each guide's filename. For "recon-external.md"
-	// register both the full stem ("recon-external") and the first segment ("recon"),
-	// without clobbering anything the built-in map (Layer 1) already owns.
-	for fname := range guidesByName {
-		stem := strings.TrimSuffix(fname, ".md")
-		if _, taken := guidesAliases[stem]; !taken {
-			guidesAliases[stem] = fname
-		}
-		if i := strings.Index(stem, "-"); i > 0 {
-			short := stem[:i]
-			if _, taken := guidesAliases[short]; !taken {
-				guidesAliases[short] = fname
-			}
-		}
-	}
+	// Layer 2: derive user-facing names from every discovered filename.
+	addDiscoveredGuideAliases(guidesByName, guidesAliases)
 
 	// Layer 3: user override file at ~/.secorizon/guides.aliases
 	//   <alias>: <filename.md>   one per line  ·  # comments allowed
@@ -7088,21 +7163,14 @@ func main() {
 			showLoaded := func() {
 				if len(guidesByName) == 0 {
 					fmt.Printf("  %sNo methodology guides available%s\n", cDim, cReset)
+					fmt.Printf("  %sAdd .md files to ~/.secorizon/guides/%s\n", cDim, cReset)
 					return
 				}
-				var avail []string
-				seen := map[string]bool{}
-				for alias, name := range guidesAliases {
-					if _, ok := guidesByName[name]; ok && !seen[name] {
-						avail = append(avail, alias)
-						seen[name] = true
-					}
-				}
-				sort.Strings(avail)
+				avail := availableGuideNames(guidesByName)
 				var loadedNames []string
 				for k, v := range guidesLoaded {
 					if v {
-						loadedNames = append(loadedNames, k)
+						loadedNames = append(loadedNames, guideCommandName(k))
 					}
 				}
 				sort.Strings(loadedNames)
@@ -7111,8 +7179,16 @@ func main() {
 				} else {
 					fmt.Printf("  %sGuides loaded:%s %s\n", cDim, cReset, strings.Join(loadedNames, ", "))
 				}
-				fmt.Printf("  %savailable:%s /guides <%s>  ·  /guides all  ·  /guides off%s\n",
-					cDim, cReset, strings.Join(avail, "|"), cReset)
+				fmt.Printf("  %sAvailable guides:%s\n", cDim, cReset)
+				for _, name := range avail {
+					filename, _ := resolveGuideName(name, guidesByName, guidesAliases)
+					loaded := ""
+					if guidesLoaded[filename] {
+						loaded = " (loaded)"
+					}
+					fmt.Printf("    %s%s%s\n", name, loaded, cReset)
+				}
+				fmt.Printf("  %sLoad one with /guides <name> · /guides all · /guides off%s\n", cDim, cReset)
 			}
 
 			switch arg {
@@ -7135,32 +7211,21 @@ func main() {
 				fmt.Printf("  %s%sGuides: ALL loaded%s (%d total) — full methodology context active\n",
 					cGreen, cBold, cReset, len(guidesByName))
 			default:
-				// Specific guide by alias (recon | web | code | methodology | ...).
-				name, ok := guidesAliases[arg]
+				// Specific guide by displayed stem, exact filename, or compatibility alias.
+				name, ok := resolveGuideName(arg, guidesByName, guidesAliases)
 				if !ok {
-					// Allow exact filename match too: /guides recon-external.md
-					if _, exists := guidesByName[arg]; exists {
-						name = arg
-						ok = true
-					}
-				}
-				if !ok {
-					fmt.Printf("  %sUnknown guide alias: %q%s\n", cYellow, arg, cReset)
+					fmt.Printf("  %sUnknown guide: %q%s\n", cYellow, arg, cReset)
 					showLoaded()
 					continue
 				}
-				if _, exists := guidesByName[name]; !exists {
-					fmt.Printf("  %sGuide file not found: %s%s\n", cYellow, name, cReset)
-					continue
-				}
 				if guidesLoaded[name] {
-					fmt.Printf("  %s%s already loaded%s\n", cDim, name, cReset)
+					fmt.Printf("  %s%s already loaded%s\n", cDim, guideCommandName(name), cReset)
 					continue
 				}
 				guidesLoaded[name] = true
 				guidesEnabled = true
 				rebuild()
-				fmt.Printf("  %s%s+ %s loaded%s — methodology now in context\n", cGreen, cBold, name, cReset)
+				fmt.Printf("  %s%s+ %s loaded%s — methodology now in context\n", cGreen, cBold, guideCommandName(name), cReset)
 			}
 			continue
 		}

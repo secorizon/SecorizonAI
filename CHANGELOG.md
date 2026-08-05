@@ -57,6 +57,12 @@ All notable changes to the SecorizonAI shell are documented here.
 
 ### Fixed
 
+- **Guide directories and filename-based loading.** First run now creates the
+  private `~/.secorizon/guides/` and `~/.secorizon/custom-guides/` directories
+  automatically. `/guides` lists the stems of guide files actually present
+  (for example, `recon.md` is shown as `recon`), and `/guides recon` loads that
+  exact file instead of allowing a legacy built-in alias to shadow it.
+
 - **Read-only shell substitutions no longer trigger false danger prompts.**
   `$(...)`, legacy backticks, and process substitutions are now parsed and
   recursively screened instead of being rejected by syntax alone. Safe path

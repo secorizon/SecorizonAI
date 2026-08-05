@@ -76,6 +76,59 @@ func TestDisplayContextKPreservesDecimalAndBinaryBudgets(t *testing.T) {
 	}
 }
 
+func TestInitializeUserGuideDirs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SECORIZON_CONFIG_DIR", "")
+
+	initializeUserGuideDirs()
+
+	for _, name := range []string{"guides", "custom-guides"} {
+		path := filepath.Join(home, ".secorizon", name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("%s was not created: %v", path, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("%s is not a directory", path)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("%s permissions = %o, want 700", path, got)
+		}
+	}
+}
+
+func TestAvailableGuideNamesComeFromPresentFiles(t *testing.T) {
+	guides := map[string]string{
+		"webapp-offensive.md": "web",
+		"recon.md":            "recon",
+		"smart-contract.md":   "contracts",
+	}
+	want := []string{"recon", "smart-contract", "webapp-offensive"}
+	got := availableGuideNames(guides)
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("availableGuideNames() = %v, want %v", got, want)
+	}
+}
+
+func TestExactGuideStemOverridesBuiltInAlias(t *testing.T) {
+	guides := map[string]string{
+		"recon.md":          "exact",
+		"recon-external.md": "legacy",
+	}
+	aliases := map[string]string{"recon": "recon-external.md"}
+	addDiscoveredGuideAliases(guides, aliases)
+
+	got, ok := resolveGuideName("recon", guides, aliases)
+	if !ok || got != "recon.md" {
+		t.Fatalf("resolveGuideName(recon) = %q, %v; want recon.md, true", got, ok)
+	}
+	got, ok = resolveGuideName("recon-external", guides, aliases)
+	if !ok || got != "recon-external.md" {
+		t.Fatalf("resolveGuideName(recon-external) = %q, %v; want recon-external.md, true", got, ok)
+	}
+}
+
 func TestRenderEditableInputShowsLongPasteAsReadableBlock(t *testing.T) {
 	prompt := "\x1b[96myou>\x1b[0m "
 	raw := strings.Repeat("abcdefghij", 30)

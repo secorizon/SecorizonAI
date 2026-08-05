@@ -14,6 +14,9 @@ vendor/
 .secorizon/
 ~/.secorizon/
 
+# Local publication drafts — not part of the GitHub package
+/blog/
+
 # IDE
 .idea/
 .vscode/

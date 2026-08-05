@@ -87,7 +87,7 @@ For the full path-search order (env override, system-wide, per-user), see
 [configuration.md § Filesystem layout](configuration.md#filesystem-layout).
 
 ```bash
-mkdir -p ~/.secorizon/guides
+./secorizon  # first run creates ~/.secorizon/guides/ and custom-guides/
 cp SECORIZON.Example.Pentester.md ~/.secorizon/SECORIZON.md
 $EDITOR ~/.secorizon/SECORIZON.md
 # Drop your own guides into ~/.secorizon/guides/ as you write them.

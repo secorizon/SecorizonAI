@@ -227,26 +227,26 @@ duplication or stale content.
 
 ### Alias system — `/guides <name>` lookup
 
-The short name you type resolves via three layers (last wins):
+The name you type first resolves against guide files that are actually present.
+An exact stem always wins: if `recon.md` exists, `/guides recon` loads it. The
+part before the first hyphen is also registered when available, so
+`mobile-pentest.md` is callable as `/guides mobile-pentest` or `/guides mobile`.
 
-1. **Built-in aliases** in the binary: `recon`, `web`, `webapp`, `code`,
-   `review`, `methodology`, `method`.
-2. **Auto-derived from filename**: for any guide `<stem>.md`, both `<stem>`
-   and the part before the first hyphen are auto-registered. So a new
-   file `mobile-pentest.md` is callable as `/guides mobile-pentest`
-   *or* `/guides mobile` with zero config.
-3. **`~/.secorizon/guides.aliases`** — optional user override file, plain
-   text, one mapping per line:
+Built-in aliases (`recon`, `web`, `webapp`, `code`, `review`, `methodology`,
+`method`) provide compatibility with the standard filenames. You can add or
+replace aliases with **`~/.secorizon/guides.aliases`**, an optional plain
+text file with one mapping per line:
 
-   ```text
-   # alias    filename
-   recon:     recon-external.md
-   ad:        active-directory.md
-   r:         recon-external.md       # short shortcut for an existing guide
-   ```
+```text
+# alias    filename
+recon:     recon-external.md
+ad:        active-directory.md
+r:         recon-external.md       # short shortcut for an existing guide
+```
 
-   Useful for renames, short shortcuts, or pointing one alias at a custom
-   guide that doesn't fit the auto-derive rules.
+This is useful for renames, short shortcuts, or pointing one alias at a custom
+guide that doesn't fit the auto-derive rules. An alias never shadows an exact
+filename stem.
 
 The unresolved filename itself is always valid too — `/guides recon-external.md`
 works even with no aliases configured.

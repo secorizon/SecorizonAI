@@ -194,15 +194,17 @@ mobile:    mobile-pentest.md
 r:         recon-external.md       # shorter alias for the same guide
 ```
 
-Three layers of resolution (last wins):
+Resolution favors files that are actually present:
 
-1. **Built-in defaults** in the binary (`recon`, `web`, `webapp`, `code`,
-   `review`, `methodology`, `method`, `smart-contract`, `sc`, `contract`,
-   `solidity`).
-2. **Auto-derived** from filename: `<stem>` and `<first-hyphen-segment>`
-   are auto-registered. So a new file `mobile-pentest.md` is callable as
-   `/guides mobile-pentest` or `/guides mobile` with zero config.
-3. **`guides.aliases`** overrides — for renames or short shortcuts.
+1. **Exact filename stem** always wins: `recon.md` is listed as `recon`, and
+   `/guides recon` loads it.
+2. **Aliases** cover alternate names. Built-in defaults include `web`,
+   `webapp`, `code`, `review`, `methodology`, `method`, `smart-contract`, `sc`,
+   `contract`, and `solidity`; the first segment of a hyphenated filename is
+   also registered when free, so `mobile-pentest.md` can be loaded with
+   `/guides mobile`.
+3. **`guides.aliases`** overrides other aliases for renames or short shortcuts,
+   but never shadows an exact filename stem.
 
 You never have to write this file; built-ins + auto-derivation cover the
 common pentest set. It exists so you can keep your own naming.
