@@ -40,6 +40,7 @@ selection made with `/cloudmodel` or `/localmodel`.
 | Option | What it does |
 |---|---|
 | `-h`, `--help` | Print command-line usage without initializing a backend. |
+| `--color` | Enable semantic role coloring for this process. Off by default and not persisted; may be combined with any backend selector. |
 | `--deepseek` | Use DeepSeek for this process without contacting Ollama. Uses the saved credential; `/cloudmodel` can enter one securely and persist the selection. |
 | `--kimi` | Use Kimi K3 for this process without contacting Ollama. Uses the saved Moonshot credential; `/cloudmodel` can enter one securely and persist the selection. |
 | `--kimi-code` | Use Kimi Code for this process without contacting Ollama. Uses the separate saved Kimi Code Console credential and defaults to model `k3`. |
@@ -248,6 +249,7 @@ Type these at the prompt:
 | `/localmodel [model]` | Persistently switch back to the remembered Ollama URL/model, optionally replacing the local model. Switching clears conversation context. |
 | `/think` | Toggle Think++ mode for Ollama or DeepSeek. Ollama uses native/prompt-based reasoning as supported; DeepSeek sends its native `thinking` API control. Kimi K3 reasoning is always on, so `/think` points to `/effort` without changing it. |
 | `/effort [low\|high\|max]` | Show or set Kimi K3 reasoning effort. The default is `high`; this control is available with either Kimi Open Platform or Kimi Code. |
+| `/color [on\|off]` | Toggle semantic role coloring for visible model text. Cyan marks progress narration, green marks completed results, and yellow marks questions. The mode is session-only, off by default, and never exposes provider-private reasoning. |
 | `/fast` | Toggle fast mode. Local Ollama uses GPU-aware sizing (16K fallback) when ON and 250K when OFF; shrinking unloads the local model so the new KV-cache size takes effect. Hosted 1M backends use a 16K/950K active harness budget without an Ollama reload. |
 | `/ctx [N]` | Show or set 2048–1M tokens. In local mode this is Ollama's exact context window; shrinking unloads the model and placement hints use detected GPU/model size. In cloud mode it changes only the harness's conversation budget because runtime context is provider-controlled. |
 | `/guides [name\|all\|off]` | Load a methodology guide on-demand. Off by default for fast cold starts. `/guides` (no arg) lists what's available and what's loaded; `/guides recon` (or any alias) injects that guide into the system prompt; `/guides all` loads every guide in `guides/`; `/guides off` strips all loaded guides. See [custom-ai.md](custom-ai.md#adding-methodology-guides) for the alias system. |

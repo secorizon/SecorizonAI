@@ -43,13 +43,16 @@ func TestParseCLIOptions(t *testing.T) {
 		args        []string
 		wantBackend string
 		wantHelp    bool
+		wantColor   bool
 		wantError   bool
 	}{
 		{name: "defaults", args: nil},
 		{name: "short help", args: []string{"-h"}, wantHelp: true},
 		{name: "long help", args: []string{"--help"}, wantHelp: true},
+		{name: "color", args: []string{"--color"}, wantColor: true},
 		{name: "deepseek", args: []string{"--deepseek"}, wantBackend: deepSeekProvider},
 		{name: "kimi", args: []string{"--kimi"}, wantBackend: kimiProvider},
+		{name: "color and kimi", args: []string{"--color", "--kimi"}, wantBackend: kimiProvider, wantColor: true},
 		{name: "kimi code", args: []string{"--kimi-code"}, wantBackend: kimiCodeProvider},
 		{name: "local", args: []string{"--local"}, wantBackend: localModelBackend},
 		{name: "conflict", args: []string{"--deepseek", "--local"}, wantError: true},
@@ -62,7 +65,7 @@ func TestParseCLIOptions(t *testing.T) {
 			if (err != nil) != test.wantError {
 				t.Fatalf("parseCLIOptions(%q) error = %v", test.args, err)
 			}
-			if got.backend != test.wantBackend || got.help != test.wantHelp {
+			if got.backend != test.wantBackend || got.help != test.wantHelp || got.color != test.wantColor {
 				t.Fatalf("parseCLIOptions(%q) = %#v", test.args, got)
 			}
 		})
@@ -73,6 +76,7 @@ func TestCLIUsageExplainsOfflineDeepSeekStartup(t *testing.T) {
 	var output strings.Builder
 	printCLIUsage(&output)
 	for _, want := range []string{
+		"--color", "semantic role coloring", "off by default",
 		"--deepseek", "/cloudmodel deepseek", "SECORIZON_MODEL_BACKEND=deepseek",
 		"--kimi", "/cloudmodel kimi", "MOONSHOT_API_KEY", "Ollama is not required",
 		"--kimi-code", "/cloudmodel kimi-code k3", "KIMI_CODE_API_KEY",
@@ -80,6 +84,68 @@ func TestCLIUsageExplainsOfflineDeepSeekStartup(t *testing.T) {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("CLI usage omitted %q:\n%s", want, output.String())
 		}
+	}
+}
+
+func TestSemanticResponseBlockStylesVisibleRoles(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		wantLabel string
+		wantStyle string
+	}{
+		{
+			name:      "reasoning",
+			raw:       `{"text":"Checking the parser next.","command":"sed -n '1,80p' parser.go","status":"continue"}`,
+			wantLabel: "reasoning ›",
+			wantStyle: cDim + cCyan,
+		},
+		{
+			name:      "result",
+			raw:       `{"text":"# Review complete\n\nNo critical findings.","command":"","status":"done"}`,
+			wantLabel: "result ›",
+			wantStyle: cBold + cGreen,
+		},
+		{
+			name:      "question",
+			raw:       `{"text":"Which target should I review?","command":"","status":"question"}`,
+			wantLabel: "question ›",
+			wantStyle: cBold + cYellow,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := semanticResponseBlock(test.raw)
+			if !strings.Contains(got, test.wantLabel) || !strings.Contains(got, test.wantStyle) {
+				t.Fatalf("semantic block = %q, want label %q and style %q", got, test.wantLabel, test.wantStyle)
+			}
+			if !strings.Contains(got, "  ") {
+				t.Fatalf("semantic block body was not indented: %q", got)
+			}
+		})
+	}
+}
+
+func TestSuppressedStreamRendererDefersVisibleText(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	os.Stdout = writer
+	renderer := &streamRender{suppressOutput: true}
+	renderer.feed(`{"text":"deferred","command":"pwd","status":"continue"}`)
+	renderer.finish()
+	_ = writer.Close()
+	os.Stdout = oldStdout
+	defer reader.Close()
+
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output) != 0 {
+		t.Fatalf("suppressed renderer wrote %q", output)
 	}
 }
 

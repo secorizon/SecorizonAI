@@ -94,6 +94,10 @@ var (
 	kimiReasoningEffort = strings.ToLower(envOr("KIMI_REASONING_EFFORT", "high"))
 	thinkMode           = false
 	fastMode            = false // local default: 250K. Hosted 1M providers default to 950K.
+	// Opt-in semantic presentation for visible model text. This is deliberately
+	// not persisted: /color toggles it for the session and --color enables it
+	// for one launch. Provider-private reasoning is never passed to this renderer.
+	semanticColorMode = false
 	// Keep local inference at 250K; hosted providers reserve 50K of their 1M
 	// capability for generation while exposing the remaining 950K to the harness.
 	numCtx               = localContextTokens
@@ -3972,6 +3976,7 @@ type streamRender struct {
 	visibleTagCandidate  []byte
 	suppressingToolCall  bool
 	toolCallClosingMatch int
+	suppressOutput       bool
 }
 
 // writeRaw emits a single byte to stdout verbatim. The state machine walks the
@@ -3999,6 +4004,10 @@ func (s *streamRender) writeRawDim(b byte) {
 // emitVisibleByte is the final output sink for decoded model text. Raw
 // fallback is dimmed; text extracted from the structured envelope is not.
 func (s *streamRender) emitVisibleByte(b byte) {
+	if s.suppressOutput {
+		s.anyTextPrinted = true
+		return
+	}
 	if s.rawMode {
 		s.writeRawDim(b)
 	} else {
@@ -4232,8 +4241,49 @@ func (s *streamRender) finish() {
 		fmt.Print(cReset)
 		s.rawColorOpen = false
 	}
-	if s.anyTextPrinted || s.rawMode {
+	if !s.suppressOutput && (s.anyTextPrinted || s.rawMode) {
 		fmt.Println()
+	}
+}
+
+// semanticResponseBlock formats the model's visible text only after the JSON
+// envelope is complete, so the label reflects its actual role. The hosted
+// providers' private reasoning_content is stored separately and never reaches
+// this function.
+func semanticResponseBlock(raw string) string {
+	parsed := parseModelResponse(raw)
+	body := strings.TrimSpace(sanitizeForTerminal(parsed.Text))
+	if body == "" {
+		return ""
+	}
+
+	label := "reasoning"
+	labelStyle := cBold + cCyan
+	bodyStyle := cDim + cCyan
+	switch parsed.Status {
+	case "done":
+		label = "result"
+		labelStyle = cBold + cGreen
+		bodyStyle = ""
+	case "question":
+		label = "question"
+		labelStyle = cBold + cYellow
+		bodyStyle = ""
+	case "continue":
+		// Visible progress narration, not provider-private chain-of-thought.
+	default:
+		label = "response"
+		labelStyle = cBold + cCyan
+		bodyStyle = cDim
+	}
+
+	body = "  " + strings.ReplaceAll(body, "\n", "\n  ")
+	return fmt.Sprintf("\n  %s%s ›%s\n%s%s%s\n", labelStyle, label, cReset, bodyStyle, body, cReset)
+}
+
+func renderSemanticResponse(raw string) {
+	if block := semanticResponseBlock(raw); block != "" {
+		fmt.Print(block)
 	}
 }
 
@@ -4574,11 +4624,12 @@ func cloudChat(provider string, messages []message, spinners ...*spinner) (strin
 	}
 
 	if isKimiBackendValue(provider) {
-		var renderer streamRender
+		renderer := streamRender{suppressOutput: semanticColorMode}
 		spinnerStopped := false
 		contentStarted := false
 		progressVisible := false
 		reasoningChars := 0
+		contentChars := 0
 		lastProgressAt := time.Time{}
 		clearProgress := func() {
 			if progressVisible {
@@ -4607,10 +4658,23 @@ func cloudChat(provider string, messages []message, spinners ...*spinner) (strin
 			if contentDelta != "" {
 				if !contentStarted {
 					clearProgress()
-					fmt.Print("\n  ")
+					lastProgressAt = time.Time{}
+					if !semanticColorMode {
+						fmt.Print("\n  ")
+					}
 					contentStarted = true
 				}
+				contentChars += len(contentDelta)
 				renderer.feed(contentDelta)
+				if semanticColorMode {
+					now := time.Now()
+					if lastProgressAt.IsZero() || now.Sub(lastProgressAt) >= time.Second {
+						fmt.Printf("\r  %s[visible response stream active · %s chars · %s elapsed]%s",
+							cDim, formatShort(contentChars), formatTaskDuration(now.Sub(started)), cReset)
+						progressVisible = true
+						lastProgressAt = now
+					}
+				}
 			}
 		}
 
@@ -4623,6 +4687,9 @@ func cloudChat(provider string, messages []message, spinners ...*spinner) (strin
 			renderer.finish()
 		}
 		if streamErr != nil {
+			if semanticColorMode && strings.TrimSpace(streamResult.Content) != "" {
+				renderSemanticResponse(streamResult.Content)
+			}
 			if ctx.Err() != nil {
 				fmt.Printf("\n  %s[stopped]%s\n", cRed, cReset)
 				return streamResult.Content, true
@@ -4636,6 +4703,9 @@ func cloudChat(provider string, messages []message, spinners ...*spinner) (strin
 		}
 
 		setLastAssistantReasoning(streamResult.Reasoning)
+		if semanticColorMode {
+			renderSemanticResponse(streamResult.Content)
+		}
 		duration := time.Since(started)
 		totalTokens := streamResult.Usage.PromptTokens + streamResult.Usage.CompletionTokens
 		servedModel := strings.TrimSpace(streamResult.Model)
@@ -4671,10 +4741,14 @@ func cloudChat(provider string, messages []message, spinners ...*spinner) (strin
 	setLastAssistantReasoning(decoded.Choices[0].Message.ReasoningContent)
 	finishSpinner()
 	result := *decoded.Choices[0].Message.Content
-	fmt.Print("\n  ")
-	renderer := &streamRender{}
-	renderer.feed(result)
-	renderer.finish()
+	if semanticColorMode {
+		renderSemanticResponse(result)
+	} else {
+		fmt.Print("\n  ")
+		renderer := &streamRender{}
+		renderer.feed(result)
+		renderer.finish()
+	}
 
 	duration := time.Since(started)
 	totalTokens := decoded.Usage.PromptTokens + decoded.Usage.CompletionTokens
@@ -4891,7 +4965,15 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 	var chatResp chatChunk // captures the final (Done:true) chunk's stats
 	spinnerStopped := false
 	firstChunkAt := time.Time{}
-	renderer := &streamRender{}
+	renderer := &streamRender{suppressOutput: semanticColorMode}
+	colorProgressVisible := false
+	colorLastProgressAt := time.Time{}
+	clearColorProgress := func() {
+		if colorProgressVisible {
+			fmt.Print("\r\033[K")
+			colorProgressVisible = false
+		}
+	}
 	loopHit := false   // set when the model degenerates into block repetition
 	lastLoopCheck := 0 // fullText length at the previous loop-detection scan
 	for scanner.Scan() {
@@ -4912,7 +4994,9 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 			}
 			spinnerStopped = true
 			firstChunkAt = time.Now()
-			fmt.Print("\n  ") // small indent so streamed text aligns with other output
+			if !semanticColorMode {
+				fmt.Print("\n  ") // small indent so streamed text aligns with other output
+			}
 		}
 		if chunk.Message.Content != "" {
 			fullText.WriteString(chunk.Message.Content)
@@ -4921,6 +5005,15 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 			// harness's command renderer prints those in formatted style after
 			// the stream ends, avoiding the previous double-output.
 			renderer.feed(chunk.Message.Content)
+			if semanticColorMode {
+				now := time.Now()
+				if colorLastProgressAt.IsZero() || now.Sub(colorLastProgressAt) >= time.Second {
+					fmt.Printf("\r  %s[visible response stream active · %s chars]%s",
+						cDim, formatShort(fullText.Len()), cReset)
+					colorProgressVisible = true
+					colorLastProgressAt = now
+				}
+			}
 
 			// Backstop for degenerate repetition (the model emitting the same
 			// finding block or boilerplate footer over and over). Sampling
@@ -4943,6 +5036,7 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 	}
 
 	if loopHit {
+		clearColorProgress()
 		if spinnerStopped {
 			renderer.finish()
 		} else if len(spinners) > 0 && spinners[0] != nil {
@@ -4952,16 +5046,27 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 		fmt.Printf("\n  %s[repetition detected — generation stopped; salvaging the report]%s\n", cYellow, cReset)
 		// Return as a clean, terminal turn so the agent loop exits and the
 		// report auto-save runs (wasInterrupted=false, not a Ctrl+C abort).
-		return salvageLoopedReport(fullText.String()), false
+		salvaged := salvageLoopedReport(fullText.String())
+		if semanticColorMode {
+			renderSemanticResponse(salvaged)
+		}
+		return salvaged, false
 	}
 	if err := scanner.Err(); err != nil {
+		clearColorProgress()
 		if !spinnerStopped && len(spinners) > 0 && spinners[0] != nil {
 			spinners[0].finish()
 			spinners[0] = nil
 		}
 		if ctx.Err() != nil {
+			if semanticColorMode && strings.TrimSpace(fullText.String()) != "" {
+				renderSemanticResponse(fullText.String())
+			}
 			fmt.Printf("\n  %s[stopped]%s\n", cRed, cReset)
 			return fullText.String(), true
+		}
+		if semanticColorMode && strings.TrimSpace(fullText.String()) != "" {
+			renderSemanticResponse(fullText.String())
 		}
 		fmt.Printf("\n  %s[stream error: %v]%s\n", cRed, err, cReset)
 		return fullText.String(), false
@@ -4969,6 +5074,7 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 	// Finish the live renderer (trailing newline only if it emitted anything),
 	// so the per-turn stats line below starts on a fresh row.
 	if spinnerStopped {
+		clearColorProgress()
 		renderer.finish()
 	} else {
 		// We never saw a chunk — server returned an empty 200. Defensive.
@@ -4980,6 +5086,9 @@ func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
 	_ = firstChunkAt // reserved for a future time-to-first-token stat
 
 	result := fullText.String()
+	if semanticColorMode {
+		renderSemanticResponse(result)
+	}
 
 	// Per-turn stats: break out load / prompt-eval / generation separately so
 	// the user can see exactly where time is going. load > 1s means the model
@@ -6531,6 +6640,7 @@ func banner() {
 type cliOptions struct {
 	backend string
 	help    bool
+	color   bool
 }
 
 func parseCLIOptions(args []string) (cliOptions, error) {
@@ -6539,6 +6649,8 @@ func parseCLIOptions(args []string) (cliOptions, error) {
 		switch arg {
 		case "-h", "--help":
 			options.help = true
+		case "--color":
+			options.color = true
 		case "--deepseek", "--kimi", "--kimi-code", "--local":
 			selected := strings.TrimPrefix(arg, "--")
 			if options.backend != "" && options.backend != selected {
@@ -6556,8 +6668,13 @@ func printCLIUsage(w io.Writer) {
 	fmt.Fprint(w, `SecorizonAI v1.3 — terminal security research AI
 
 Usage:
-  secorizon [--deepseek | --kimi | --kimi-code | --local]
+  secorizon [--color] [--deepseek | --kimi | --kimi-code | --local]
   secorizon -h | --help
+
+Presentation:
+  --color      Enable semantic role coloring for this run (off by default).
+               Visible narration, final results, and questions get distinct
+               labels; provider-private reasoning remains hidden.
 
 Backend selection:
   --deepseek   Use DeepSeek for this run; Ollama is not required.
@@ -6652,6 +6769,8 @@ func printHelp() {
   %s/localmodel%s [model]          Persistently switch back to Ollama.
   %s/think%s                      Toggle provider-native/prompt-based Think++ reasoning.
   %s/effort%s [low|high|max]      Show or set Kimi K3 reasoning effort (default: high).
+  %s/color%s [on|off]             Toggle semantic role coloring (off by default).
+                              Distinguishes visible reasoning, results, and questions.
   %s/fast%s                       Toggle fast mode. Local: GPU-sized/250K context.
                               Cloud: 16K/950K active harness budget for 1M models.
   %s/ctx%s [N]                    Show or set context window (e.g. /ctx 16k, /ctx 65536, /ctx 250k).
@@ -6679,7 +6798,7 @@ func printHelp() {
 `, cBold, cCyan, cReset, // banner
 		cBold, cReset, cBold, cReset, cBold, cReset, // /help, /clear, /model
 		cBold, cReset, cBold, cReset, // /cloudmodel, /localmodel
-		cBold, cReset, cBold, cReset, // /think, /effort
+		cBold, cReset, cBold, cReset, cBold, cReset, // /think, /effort, /color
 		cBold, cReset, cBold, cReset, cBold, cReset, // /fast, /ctx, /guides
 		cBold, cReset, // /burp
 		cBold, cReset, cBold, cReset, // /sessions, /resume
@@ -6700,6 +6819,7 @@ func main() {
 		printCLIUsage(os.Stdout)
 		return
 	}
+	semanticColorMode = cli.color
 
 	// Load any persisted audit scratchpad (cross-unit memory for /bymodule).
 	scratch.load()
@@ -6734,6 +6854,10 @@ func main() {
 		return
 	}
 	banner()
+	if semanticColorMode {
+		fmt.Printf("  %ssemantic color mode: ON%s · reasoning %scyan%s · results %sgreen%s · questions %syellow%s\n",
+			cDim, cReset, cCyan, cReset, cGreen, cReset, cYellow, cReset)
+	}
 	remoteOllama := ollamaServerIsRemote(ollamaURL)
 	gpus := gpuInfo{}
 	modelMB := 0
@@ -7133,6 +7257,29 @@ func main() {
 
 		if lower == "/help" {
 			printHelp()
+			continue
+		}
+
+		if lower == "/color" || strings.HasPrefix(lower, "/color ") {
+			arg := strings.TrimSpace(strings.TrimPrefix(lower, "/color"))
+			switch arg {
+			case "":
+				semanticColorMode = !semanticColorMode
+			case "on":
+				semanticColorMode = true
+			case "off":
+				semanticColorMode = false
+			default:
+				fmt.Printf("  %sUsage: /color [on|off]%s\n", cYellow, cReset)
+				continue
+			}
+			if semanticColorMode {
+				fmt.Printf("  %sSemantic color mode: ON%s — %s%sreasoning ›%s cyan, %s%sresult ›%s green, %s%squestion ›%s yellow.\n",
+					cGreen, cReset, cBold, cCyan, cReset, cBold, cGreen, cReset, cBold, cYellow, cReset)
+				fmt.Printf("  %sOnly visible model narration is styled; provider-private reasoning remains hidden.%s\n", cDim, cReset)
+			} else {
+				fmt.Printf("  %sSemantic color mode: OFF%s\n", cDim, cReset)
+			}
 			continue
 		}
 
@@ -8267,7 +8414,7 @@ func main() {
 				}
 				messages = append(messages, assistantMessageForResponse(response))
 				finalParsed := parseModelResponse(response)
-				if finalParsed.Text != "" {
+				if finalParsed.Text != "" && !semanticColorMode {
 					fmt.Printf("\n%s\n", sanitizeForTerminal(finalParsed.Text))
 				}
 				break

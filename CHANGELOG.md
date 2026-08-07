@@ -6,6 +6,14 @@ All notable changes to the SecorizonAI shell are documented here.
 
 ### Added
 
+- **Opt-in semantic terminal coloring.** Start with `--color` or toggle
+  `/color [on|off]` to render visible progress narration under a cyan
+  `reasoning ›` label, completed responses under a green `result ›` label,
+  and user-directed questions under a yellow `question ›` label. The mode is
+  off by default and is not persisted. While it buffers a structured response
+  long enough to identify its role, the terminal keeps showing a live character
+  counter. Provider-private DeepSeek/Kimi reasoning remains hidden.
+
 - **Kimi K3 API backend.** `/cloudmodel kimi [model]`, `--kimi`, and
   `SECORIZON_MODEL_BACKEND=kimi` select Moonshot AI's OpenAI-compatible K3
   endpoint without requiring Ollama. K3's always-on reasoning uses

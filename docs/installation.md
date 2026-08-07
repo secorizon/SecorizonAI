@@ -312,7 +312,7 @@ valid JSON — see [custom-ai.md](custom-ai.md) for compatible models.
 ## What you'll see during a session
 
 A working session looks like a back-and-forth: you type, the agent thinks,
-runs commands, reads output, thinks again. The shell surfaces three runtime
+runs commands, reads output, thinks again. The shell surfaces five runtime
 behaviors you should know about up front — they're normal, not errors.
 
 ### `⠋ analyzing...` (the spinner)
@@ -331,6 +331,19 @@ If the spinner runs for **2+ minutes on every prompt** and the stats line
 shows `prompt < 200 tk/s` and `gen < 15 tk/s`, the model is too
 big for your VRAM and is partially CPU-offloading. Drop a quantization tier
 (Q5_K_M → Q4_K_M), shrink `/ctx`, or pick a smaller model.
+
+### Optional semantic role colors
+
+Run `./secorizon --color` or type `/color` to enable the opt-in presentation
+mode. Visible progress narration is printed below a cyan `reasoning ›` label,
+completed output below a green `result ›` label, and questions below a yellow
+`question ›` label. `/color off` restores the normal renderer. This setting is
+not persisted and remains off on the next launch unless `--color` is supplied.
+
+Because the JSON status determines whether text is progress or a result, this
+mode shows a live character counter while receiving each response and prints
+the labeled body as soon as the structured response completes. DeepSeek/Kimi
+private reasoning is not displayed or passed to the semantic renderer.
 
 ### Stats line — what the numbers mean
 

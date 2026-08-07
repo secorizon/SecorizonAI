@@ -44,6 +44,10 @@ mkdir -p ~/.secorizon && cp SECORIZON.Example.Pentester.md ~/.secorizon/SECORIZO
 SECORIZON_MODEL=<your-model>:tag ./secorizon
 ```
 
+Add `--color` to any launch, or type `/color` in the shell, to opt into
+semantic labels for visible reasoning, final results, and questions. This
+presentation mode is deliberately off by default and is not persisted.
+
 To launch directly with DeepSeek—without requiring Ollama—and persist the
 selection from the running shell:
 
@@ -97,9 +101,10 @@ For the deeper walkthrough (HuggingFace → Ollama, Modelfile, smoke tests), see
 
 ## What running the shell looks like
 
-A session is a back-and-forth: you type, the agent thinks, runs commands, reads output, thinks again. Five runtime behaviors are normal — not errors:
+A session is a back-and-forth: you type, the agent thinks, runs commands, reads output, thinks again. Six runtime behaviors are normal — not errors:
 
-- **`⠋ analyzing...`** — the model is generating its next response between turns. If local Ollama spins 2+ minutes on the *first* prompt, the model is probably cold-loading from disk (per-request `keep_alive: 24h` is already wired in; `OLLAMA_KEEP_ALIVE=24h` on the daemon is belt-and-braces). 2+ minutes on *every* local prompt usually means another client is evicting the model. Kimi switches to an explicit `reasoning stream active` counter as soon as its first private reasoning delta arrives, then renders answer text live; `/effort high` or `/effort low` reduces K3 latency when `max` is unnecessary.
+- **`⠋ analyzing...`** — the model is generating its next response between turns. If local Ollama spins 2+ minutes on the *first* prompt, the model is probably cold-loading from disk (per-request `keep_alive: 24h` is already wired in; `OLLAMA_KEEP_ALIVE=24h` on the daemon is belt-and-braces). 2+ minutes on *every* local prompt usually means another client is evicting the model. Kimi switches to an explicit `reasoning stream active` counter as soon as its first private reasoning delta arrives; `/effort high` or `/effort low` reduces K3 latency when `max` is unnecessary.
+- **Optional semantic colors** — `--color` or `/color` keeps a live response-stream counter, then labels visible progress as cyan `reasoning ›`, completed output as green `result ›`, and questions as yellow `question ›`. It never prints the providers' private reasoning stream.
 - **Stats line under every reply** — Ollama shows `[model] tokens | prompt
   NNNtk/s | gen NN.Ntk/s | total Xs` (and `load X.Xs` only on reload);
   DeepSeek and Kimi show provider prompt/completion token counts and total time.
