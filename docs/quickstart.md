@@ -40,7 +40,7 @@ SECORIZON_MODEL=my-agent ./secorizon
 
 If you understand each line, you're done. The rest of this doc explains the choices.
 
-### Hosted alternative: DeepSeek V4 Flash
+### Hosted alternatives: DeepSeek V4 Flash or Kimi K3
 
 If you do not want to install or run Ollama, build SecorizonAI, start it, and
 select DeepSeek from the prompt:
@@ -59,8 +59,41 @@ The launch override bypasses the initial Ollama check without storing a secret
 in shell history. The masked `/cloudmodel` prompt saves the credential and
 makes the choice persistent; `/localmodel [model]` switches back to Ollama.
 Hosted mode sends the conversation and any tool results placed in model context
-to the DeepSeek API, while command execution remains on the machine running
+to the selected provider's API, while command execution remains on the machine running
 SecorizonAI.
+
+Kimi K3 follows the same flow:
+
+```bash
+go build -o secorizon ./chat.go
+./secorizon --kimi
+```
+
+```text
+/cloudmodel kimi kimi-k3
+# enter the Moonshot API key at the masked prompt
+/effort high
+```
+
+K3 reasoning is always enabled; `/effort` accepts `low`, `high` (the default),
+or `max`. SecorizonAI retains K3's reasoning content in assistant history
+so multi-turn requests remain valid.
+
+`/cloudmodel kimi` expects a pay-as-you-go Open Platform key from
+`platform.kimi.ai`. A Kimi Code subscription key is a different credential and
+uses a different endpoint/model ID:
+
+```bash
+./secorizon --kimi-code
+```
+
+```text
+/cloudmodel kimi-code k3
+# enter the Kimi Code Console key at the masked prompt
+```
+
+Do not mix the two key types: Kimi returns 401 when a Kimi Code key is sent to
+the Open Platform endpoint, or vice versa.
 
 ---
 

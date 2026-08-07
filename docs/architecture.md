@@ -28,7 +28,7 @@ How the shell actually works internally. Read this if you want to extend it, deb
 └────────────────────────┬─────────────────────────────────────────┘
                          │
 ┌────────────────────────▼─────────────────────────────────────────┐
-│  ollamaChat(messages) dispatches to Ollama or DeepSeek             │
+│  ollamaChat dispatches to Ollama, DeepSeek, Kimi, or Kimi Code     │
 │  → selected model returns one JSON response                       │
 └────────────────────────┬─────────────────────────────────────────┘
                          │
@@ -77,7 +77,7 @@ Sections, in declaration order (search for each section's leading function or co
 | Config loader (`loadSystemPrompt`) | Resolves `SECORIZON.md` path (env override → system-wide → per-user) and reads it. |
 | History (`saveHistory`, `loadInputHistory`, `saveInputHistory`) | Session transcript + arrow-up input recall. |
 | Raw-mode reader (`readLine`, `readLineRaw`, `readLineCooked`) | Terminal input with paste support, prompt redraw, bracketed-paste, Ctrl+D handling. |
-| Model clients (`deepSeekChat`, `ollamaChat`, `chatRequest`, `chatResponse`) | `ollamaChat` is the backend dispatcher. Local requests stream through Ollama; DeepSeek requests use its OpenAI-compatible Chat Completions endpoint with native thinking and JSON-object mode. |
+| Model clients (`cloudChat`, `deepSeekChat`, `kimiChat`, `kimiCodeChat`, `ollamaChat`, `chatRequest`, `chatResponse`) | `ollamaChat` is the backend dispatcher. Local Ollama and both Kimi paths stream their responses; DeepSeek remains bounded non-streaming. Cloud providers use OpenAI-compatible Chat Completions endpoints with provider-specific reasoning controls and JSON-object mode. |
 | GPU detection (`detectGPUs`, `listLoadedModelInfo`, `recommendCtx`, `snapCtx`) | Local Ollama: shells out to `nvidia-smi` once. Remote Ollama: reads the loaded model's GPU/CPU split and model VRAM from `/api/ps`; remote GPU inventory is not exposed by Ollama. |
 | Network checks (`networkFailureReason`, `checkNetworkUp`) | Distinguishes "the internet is down" from "this one target is broken". |
 | Danger filters (`dangerousBins`, `dangerousSubstrings`, `dangerousRedirRe`, `safeRedirTargets`, `extractShellCBody`, `checkBinDanger`, `isDangerous`) | Pre-execution command screening (see "Command execution" below). |
@@ -169,7 +169,7 @@ type ModelResponse struct {
 3. **Malformed/truncated JSON.** Best-effort string extraction of the `text` field; sets `parseError` and forces `Status: "continue"` so the loop re-prompts.
 
 The selected provider constrains this envelope. Ollama receives `"format":
-"json"`; DeepSeek receives `"response_format":{"type":"json_object"}`.
+"json"`; DeepSeek and both Kimi providers receive `"response_format":{"type":"json_object"}`.
 Modern models honor this well; older or smaller local models may ignore it.
 
 ## Command execution
@@ -220,7 +220,7 @@ Breakdown:
 - `load X.Xs` — **only printed when > 1s**. If you see it on every turn, the model is being evicted between requests (another client, missing `keep_alive`, or VRAM contention). Each load means a 30-120s reload of the full weights from disk.
 - `total Xs` — wall-clock duration.
 
-DeepSeek reports provider token accounting instead of local throughput:
+Cloud providers report token accounting instead of local throughput:
 
 ```
 [deepseek-v4-flash] 5.8k tokens | prompt 5200 | gen 600 | 9.4s total
@@ -231,28 +231,42 @@ for a hosted response.
 
 ## Model backends and trust boundary
 
-Ollama is the default backend. `/cloudmodel deepseek [model]` is an explicit,
-persistent opt-in to DeepSeek; `/localmodel [model]` switches persistently back
-to the remembered Ollama server and model. Environment variables can override
-the saved selection for one process without rewriting it.
+Ollama is the default backend. `/cloudmodel deepseek [model]`,
+`/cloudmodel kimi [model]`, and `/cloudmodel kimi-code [model]` explicitly opt
+into a hosted provider;
+`/localmodel [model]` switches persistently back to the remembered Ollama
+server and model. Environment variables can override the saved selection for
+one process without rewriting it.
 
 DeepSeek uses `POST <base-url>/chat/completions`, Bearer authentication,
-provider-native thinking control, JSON-object response mode, and a bounded
-non-streaming response body. The same `ModelResponse` envelope drives the
-existing command/search loop, so command execution remains local. The trust
-boundary does change: every message sent as model context—including system
-prompt text, user prompts, command output, web-search results, and loaded
-guides—is transmitted to DeepSeek while that backend is active. The API key is
-never included in the request body, terminal echo is disabled while it is
+provider-native thinking control, and JSON-object response mode. Kimi Open
+Platform uses `api.moonshot.ai/v1` with model `kimi-k3`; Kimi Code uses the
+separate subscription endpoint `api.kimi.com/coding/v1` with model `k3`.
+The two products' credentials are stored under different provider keys because
+Kimi does not accept one product's key at the other endpoint. Both omit
+DeepSeek's `thinking` object and send top-level `reasoning_effort`. K3 always
+reasons; its returned
+`reasoning_content` is retained on the assistant message and sent back on the
+next request, as required by the provider's multi-turn protocol. Both Kimi
+clients request Server-Sent Events, count private reasoning deltas without
+printing their contents, render answer content live, and reject a stream that
+ends without the provider's `[DONE]` marker. DeepSeek retains its bounded
+non-streaming response path. The same `ModelResponse` envelope drives the
+existing command/search loop, so command execution remains local.
+
+The trust boundary changes in cloud mode: every message sent as model
+context—including system prompt text, user prompts, command output, web-search
+results, and loaded guides—is transmitted to the selected provider. API keys
+are never included in request bodies, terminal echo is disabled while they are
 entered, and provider error text is bounded and redacted before display.
 
 Selection and credentials are deliberately separate:
 
 - `~/.secorizon/model-settings.json` stores backend, model, and endpoint.
-- `~/.secorizon/cloud-credentials.json` stores the API key.
+- `~/.secorizon/cloud-credentials.json` stores API keys under separate provider names.
 
-Both are written atomically with mode 0600. `DEEPSEEK_BASE_URL` must be an
-absolute HTTPS URL.
+Both are written atomically with mode 0600. Cloud base URLs must be absolute
+HTTPS URLs.
 
 ## Web search
 
@@ -313,9 +327,10 @@ The following state affects model invocation:
 
 | Flag | Effect | Set by |
 |---|---|---|
-| `modelBackend` | Selects local Ollama or hosted DeepSeek. The selection persists unless temporarily overridden by a startup selector or environment variable. | `/cloudmodel`, `/localmodel`, `--deepseek`, `--local`, `SECORIZON_MODEL_BACKEND` |
-| `thinkMode` | Enables provider-native thinking (`chatRequest.Think` for supported Ollama models; `thinking.type=enabled` for DeepSeek). The local-only reminder suffix is not sent to DeepSeek. | `/think` |
-| `fastMode` + `numCtx` | Local default is 250K; `/fast` uses GPU-aware sizing or 16K and `/ctx` controls Ollama `num_ctx`. DeepSeek defaults to a 250K active harness budget within its provider-controlled 1M capability; `/ctx` changes only that harness budget and `/fast` toggles 16K/250K. Ollama unload/reload and placement hints apply only to local mode. | `/fast`, `/ctx <N>`, `SECORIZON_NUM_CTX` |
+| `modelBackend` | Selects local Ollama, hosted DeepSeek, Kimi Open Platform, or Kimi Code. The selection persists unless temporarily overridden by a startup selector or environment variable. | `/cloudmodel`, `/localmodel`, `--deepseek`, `--kimi`, `--kimi-code`, `--local`, `SECORIZON_MODEL_BACKEND` |
+| `thinkMode` | Enables provider-native thinking (`chatRequest.Think` for supported Ollama models; `thinking.type=enabled` for DeepSeek). Kimi reasoning is always enabled and does not use this flag. | `/think` |
+| `kimiReasoningEffort` | Sets Kimi K3's always-on reasoning depth to `low`, `high`, or `max`. | `/effort`, `KIMI_REASONING_EFFORT` |
+| `fastMode` + `numCtx` | Local default is 250K; `/fast` uses GPU-aware sizing or 16K and `/ctx` controls Ollama `num_ctx`. Hosted models with a 1M provider capability default to a 950K active harness budget, retaining 50K for generation; `/ctx` changes only that harness budget and `/fast` toggles 16K/950K. Ollama unload/reload and placement hints apply only to local mode. | `/fast`, `/ctx <N>`, `SECORIZON_NUM_CTX` |
 | `gpus` (GPU info) | When `OLLAMA_URL` is local, populated once by `detectGPUs()` using `nvidia-smi --query-gpu=name,memory.total` and used for `/ctx`/`/fast` placement hints. For a non-loopback Ollama URL, client-side GPU probing is deliberately skipped: `/api/ps` reports the loaded model's `size`/`size_vram` GPU/CPU split, at startup if warm or after the first response if cold. Ollama does not expose remote GPU names, count, or total VRAM, so remote capacity-based auto-sizing is not attempted. | banner display, post-load placement line |
 | `keep_alive` (per request) | Sent in every `/api/chat` payload as `KeepAlive: envOr("SECORIZON_KEEP_ALIVE", "24h")`. Pins the model in VRAM across turns, defending against any Ollama client/proxy chain that defaults the field to 0. | `SECORIZON_KEEP_ALIVE` |
 | Startup model eviction | `listLoadedModels()` is called in `main()` after greeting; any model that isn't `model` (the active selection) is unloaded with `keep_alive=0`. Prevents ping-pong eviction with other Ollama clients (e.g. concurrent SecInvest workers) that share the same daemon. | automatic; banner prints `evicted stale model from VRAM: <name>` |
@@ -351,7 +366,7 @@ If you want to add new capabilities, here's where to look:
 |---|---|
 | New slash command | The big switch in main() around line 1840+ |
 | New tool (besides command + search) | New field in ModelResponse + handler in the task loop |
-| Additional LLM provider | Add a provider client beside `deepSeekChat()` and dispatch to it from `ollamaChat()`; extend persistent provider validation and slash commands |
+| Additional LLM provider | Add its defaults and request differences to `cloudChat()`/the provider registry, then extend persistent validation and slash-command help |
 | Different web search | Replace `webSearch()` |
 | New filesystem locations | `loadConfig()` and `loadGuides()` |
 | Custom command filters | `dangerousBins`, `dangerousSubstrings`, `isDangerous()` |

@@ -25,14 +25,14 @@ shape we maintain at Secorizon and ship as part of the Pro license.
 | Component | Why | Where to get it |
 |---|---|---|
 | **Go 1.25+** | Build the binary and its pinned `x/term` dependency | https://go.dev/dl/ — or your package manager |
-| **Ollama** | Serve the default local LLM; optional when using only DeepSeek | https://ollama.com/download |
-| **A model or DeepSeek API key** | The actual brain | `ollama pull <name>` or a DeepSeek API credential |
+| **Ollama** | Serve the default local LLM; optional when using only a cloud backend | https://ollama.com/download |
+| **A model or cloud API key** | The actual brain | `ollama pull <name>`, a DeepSeek key, a Kimi Open Platform key, or a Kimi Code key |
 | **Docker + Compose** | Optional, for containerized deploys | https://docs.docker.com/get-docker/ |
 | **Linux or macOS** | Tested on Ubuntu 22.04 + macOS 14 | Other Unixes likely work; Windows untested |
 
 GPU is **strongly recommended** for local inference (CPU inference is
-technically possible but slow enough to be impractical). Hosted DeepSeek mode
-does not use or inspect a local GPU.
+technically possible but slow enough to be impractical). Hosted DeepSeek and
+Kimi modes do not use or inspect a local GPU.
 
 ---
 
@@ -133,7 +133,7 @@ the interactive prompt in disconnected mode. Start `ollama serve`, correct
 `OLLAMA_URL`, run `/cloudmodel`, or continue using `/help` and direct
 `!<command>` execution while no AI backend is connected.
 
-### Optional: use DeepSeek V4 Flash
+### Optional: use DeepSeek V4 Flash or Kimi K3
 
 Ollama remains the default. To opt into the hosted DeepSeek backend from the
 running shell:
@@ -145,14 +145,42 @@ running shell:
 
 If this is the first launch and no Ollama daemon is available, use
 `./secorizon --deepseek`; then run `/cloudmodel` above. That avoids putting the
-API key in shell history. `./secorizon -h` lists the temporary `--deepseek` and
-`--local` startup selectors.
+API key in shell history. `./secorizon -h` lists the temporary `--deepseek`,
+`--kimi`, `--kimi-code`, and `--local` startup selectors.
+
+Kimi K3 uses the same persistent-provider flow:
+
+```text
+./secorizon --kimi
+/cloudmodel kimi kimi-k3
+# enter the Moonshot API key at the masked prompt
+/effort high
+```
+
+K3 reasoning is always enabled. `/effort low|high|max` controls its depth and
+defaults to `high`; `/think` remains the DeepSeek/Ollama reasoning toggle.
+
+That `kimi` provider is the pay-as-you-go Open Platform: it requires a key
+created at `platform.kimi.ai`, uses `https://api.moonshot.ai/v1`, and sends
+model ID `kimi-k3`. If your key came from the Kimi Code Console as part of a
+Kimi Code membership, use the separate subscription provider instead:
+
+```text
+./secorizon --kimi-code
+/cloudmodel kimi-code k3
+# enter the Kimi Code Console key at the masked prompt
+```
+
+Open Platform and Kimi Code keys are not interchangeable. The latter uses
+`https://api.kimi.com/coding/v1` and model ID `k3`; SecorizonAI stores both
+credentials independently. A 401 response prints this distinction directly.
 
 The switch is persistent and clears the current conversation context. It does
-not require Ollama to be running on later launches. While DeepSeek is active,
-the system prompt, user messages, loaded guides, web-search results, and command
-output included in model context are sent to the DeepSeek API; shell commands
-still execute locally. Return persistently to the remembered Ollama model with:
+not require Ollama to be running on later launches. While a cloud provider is
+active, the system prompt, user messages, loaded guides, web-search results, and command
+output included in model context are sent to the selected provider's API;
+shell commands still execute locally. Return persistently to the remembered
+Ollama model with:
 
 ```text
 /localmodel
@@ -170,10 +198,37 @@ SECORIZON_CLOUD_MODEL=deepseek-v4-flash \
 DEEPSEEK_API_KEY='<key>' ./secorizon
 ```
 
-DeepSeek mode defaults to a 250K active harness budget within the provider's
-1M model capability. `/ctx` changes the harness budget only; `/think` controls
+Or select Kimi for one process:
+
+```bash
+SECORIZON_MODEL_BACKEND=kimi \
+SECORIZON_CLOUD_MODEL=kimi-k3 \
+MOONSHOT_API_KEY='<key>' ./secorizon
+```
+
+For a Kimi Code subscription key:
+
+```bash
+SECORIZON_MODEL_BACKEND=kimi-code \
+SECORIZON_CLOUD_MODEL=k3 \
+KIMI_CODE_API_KEY='<key>' ./secorizon
+```
+
+DeepSeek mode defaults to a 950K active harness budget within the provider's
+1M model capability, leaving 50K for generation. `/ctx` changes the harness budget only; `/think` controls
 DeepSeek's native thinking mode. `DEEPSEEK_BASE_URL` may override the endpoint,
 but it must be an absolute HTTPS URL.
+
+Kimi K3 also defaults to a 950K active harness budget within its 1M capability,
+leaving 50K for generation.
+`MOONSHOT_BASE_URL` (or `KIMI_BASE_URL`) may override its endpoint, and
+`MOONSHOT_API_KEY` may be spelled `KIMI_API_KEY`. Custom endpoints must use
+absolute HTTPS URLs.
+
+Kimi Code defaults to `https://api.kimi.com/coding/v1`; override it with
+`KIMI_CODE_BASE_URL` only when Kimi documents a different compatible route.
+Its default is also 950K; accounts with a lower membership context limit should
+set `/ctx` or `SECORIZON_NUM_CTX` accordingly.
 
 ---
 
@@ -333,7 +388,22 @@ twice on an empty prompt. The startup banner says this explicitly.
 **`Cannot connect to Ollama`**
 `ollama serve` isn't running, or `OLLAMA_URL` is wrong. The shell remains open
 in disconnected mode. Verify with `curl $OLLAMA_URL/api/tags`, start Ollama,
-or switch from the prompt with `/cloudmodel deepseek deepseek-v4-flash`.
+or switch from the prompt with `/cloudmodel deepseek deepseek-v4-flash` or
+`/cloudmodel kimi kimi-k3`.
+
+**`Kimi Open Platform returned 401 Unauthorized: Invalid Authentication`**
+The key does not belong to the selected Kimi product or region. A key created
+at `platform.kimi.ai` uses `/cloudmodel kimi kimi-k3`. A Kimi Code Console key
+uses `/cloudmodel kimi-code k3`. Re-enter it at the masked prompt; leaving the
+prompt blank deliberately keeps the previously saved key.
+
+**Kimi stays on `analyzing` for several minutes**
+K3 can spend a long time in always-on reasoning at `/effort max`, especially
+with a large conversation. SecorizonAI switches to a live reasoning-stream
+counter when Kimi sends its first private reasoning delta and renders answer
+content as it arrives. Use `/effort high` for a faster strong default or
+`/effort low` when latency matters more than depth. `Ctrl+C` safely cancels the
+current stream and returns to the prompt.
 
 **`Model 'my-agent' not found in Ollama`**
 `ollama list` doesn't show it — either the `ollama create` step failed, or

@@ -6,7 +6,7 @@
 
 A terminal-native AI shell built for security professionals. Single Go binary,
 local model via [Ollama](https://ollama.com) by default, optional DeepSeek V4
-Flash API backend, strict JSON tool-use loop, plain-markdown system prompt +
+Flash plus Kimi K3 Open Platform and Kimi Code API backends, strict JSON tool-use loop, plain-markdown system prompt +
 methodology guides — and zero patience for cloud-AI condescension about whether
 you're "authorized."
 
@@ -25,9 +25,11 @@ If you've gotten tired of cloud-LLM agents treating every authorized engagement 
 - **Built-in web search.** When the model needs information it doesn't have — a current CVE, a vendor advisory, a recent writeup — it issues a search query and the results feed back into the next turn. No API keys, no rate limits.
 - **A system prompt + methodology guides** define the agent's identity and workflow. Plain markdown. Edit and restart. The repo ships skeleton examples; the production playbooks (recon, web, code review, exploit dev, AD) are the Pro product. Guides are loaded on-demand at the prompt (`/guides recon`, `/guides web`, …) so cold starts stay snappy and context only grows with what the current task actually needs.
 - **Local-first, cloud-optional.** Ollama remains the default and keeps inference
-  on your hardware. `/cloudmodel deepseek` is an explicit opt-in that sends the
-  model conversation—including tool results placed in context—to DeepSeek;
-  `/localmodel` switches persistently back to Ollama.
+  on your hardware. `/cloudmodel deepseek`, `/cloudmodel kimi`, and
+  `/cloudmodel kimi-code` are explicit
+  opt-ins that send the model conversation—including tool results placed in
+  context—to the selected provider; `/localmodel` switches persistently back
+  to Ollama.
 
 The default ships with a security-research persona, but the architecture is general — see [docs/custom-ai.md](docs/custom-ai.md) if you want to repurpose for a different domain.
 
@@ -55,11 +57,36 @@ selection from the running shell:
 /localmodel secorizon:v2                  # switch persistently back to Ollama
 ```
 
+Kimi K3 works the same way:
+
+```bash
+./secorizon --kimi
+```
+
+```text
+/cloudmodel kimi kimi-k3
+# enter the Moonshot API key at the masked prompt
+/effort high                              # optional: low, high, or max
+```
+
+The command above requires a pay-as-you-go Open Platform key from
+`platform.kimi.ai`. Kimi Code subscription keys use a separate endpoint and
+model ID:
+
+```text
+/cloudmodel kimi-code k3
+# enter the Kimi Code Console key at the masked prompt
+```
+
+Kimi documents that Open Platform and Kimi Code keys are not interchangeable;
+the harness stores them under separate provider names.
+
 Backend/model selection persists in `~/.secorizon/model-settings.json`. The API
 key is isolated in `~/.secorizon/cloud-credentials.json`; both files are private
-mode 0600. `DEEPSEEK_API_KEY` and the other cloud environment variables provide
-temporary overrides without rewriting the saved selection.
-`./secorizon -h` documents the temporary `--deepseek` and `--local` startup
+mode 0600. `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `KIMI_CODE_API_KEY`, and the other cloud
+environment variables provide temporary overrides without rewriting the saved
+selection. `./secorizon -h` documents the temporary `--deepseek`, `--kimi`,
+`--kimi-code`, and `--local` startup
 selectors. If the selected Ollama server or model is unavailable, the harness
 now starts in disconnected mode so `/cloudmodel`, `/help`, and `!<command>`
 remain usable.
@@ -72,10 +99,10 @@ For the deeper walkthrough (HuggingFace → Ollama, Modelfile, smoke tests), see
 
 A session is a back-and-forth: you type, the agent thinks, runs commands, reads output, thinks again. Five runtime behaviors are normal — not errors:
 
-- **`⠋ analyzing...`** — the model is generating its next response between turns. If it spins 2+ minutes on the *first* prompt, the model is cold-loading from disk (per-request `keep_alive: 24h` is already wired in; `OLLAMA_KEEP_ALIVE=24h` on the daemon is belt-and-braces). 2+ minutes on *every* prompt means another client is evicting the model — see the stats line below.
+- **`⠋ analyzing...`** — the model is generating its next response between turns. If local Ollama spins 2+ minutes on the *first* prompt, the model is probably cold-loading from disk (per-request `keep_alive: 24h` is already wired in; `OLLAMA_KEEP_ALIVE=24h` on the daemon is belt-and-braces). 2+ minutes on *every* local prompt usually means another client is evicting the model. Kimi switches to an explicit `reasoning stream active` counter as soon as its first private reasoning delta arrives, then renders answer text live; `/effort high` or `/effort low` reduces K3 latency when `max` is unnecessary.
 - **Stats line under every reply** — Ollama shows `[model] tokens | prompt
   NNNtk/s | gen NN.Ntk/s | total Xs` (and `load X.Xs` only on reload);
-  DeepSeek shows provider prompt/completion token counts and total time.
+  DeepSeek and Kimi show provider prompt/completion token counts and total time.
 - **`(command backgrounded after 30s)`** — quiet long-running commands (full nmap, deep `find`, recursive `grep`, large `crt.sh` pulls) move to the background after 30s. Combined stdout/stderr is already streaming to a private `/tmp/secorizon_bg_<random>.txt` file when the notice appears, and completion status plus a bounded output preview is automatically delivered to the model on its next turn. `tail -f` the displayed path to watch live.
 - **`Ctrl+C` cancels the current command or model stream — not the shell.** To quit, type `/exit` (saves session history) or hit `Ctrl+D` twice on an empty prompt.
 - **Completed tasks are auto-saved as Markdown reports.** When the model returns
@@ -163,7 +190,7 @@ The unique combination of **local + shell-execute + pentest-tuned prompt + anti-
 ## Two-line summary if you skip the docs
 
 The shell sends your message + system prompt to the selected backend—local
-Ollama by default, or DeepSeek after explicit opt-in. The model responds with
+Ollama by default, or DeepSeek/Kimi after explicit opt-in. The model responds with
 structured JSON containing prose for you, and optionally a shell command to run
 or a web search to perform. The shell executes those, feeds results back, and
 loops until the model says "done"—then saves the final task report under

@@ -6,6 +6,17 @@ All notable changes to the SecorizonAI shell are documented here.
 
 ### Added
 
+- **Kimi K3 API backend.** `/cloudmodel kimi [model]`, `--kimi`, and
+  `SECORIZON_MODEL_BACKEND=kimi` select Moonshot AI's OpenAI-compatible K3
+  endpoint without requiring Ollama. K3's always-on reasoning uses
+  `/effort low|high|max` (default `high`), and returned `reasoning_content` is
+  retained in assistant history as required for multi-turn K3 conversations.
+  `/cloudmodel kimi-code k3` and `--kimi-code` separately support Kimi Code
+  subscription keys at `api.kimi.com/coding/v1`; `/cloudmodel kimi kimi-k3`
+  remains the pay-as-you-go Open Platform path at `api.moonshot.ai/v1`.
+  Kimi Code, Moonshot, and DeepSeek credentials remain isolated by provider in
+  the private credential store; DeepSeek and local Ollama behavior are unchanged.
+
 - **Persistent DeepSeek V4 Flash backend.** `/cloudmodel deepseek [model]`
   opts into DeepSeek's OpenAI-compatible Chat Completions API with native
   thinking control and JSON-object output; `/localmodel [model]` returns to
@@ -16,11 +27,12 @@ All notable changes to the SecorizonAI shell are documented here.
   mode does not require a reachable Ollama server or local GPU.
 
 - **Backend-aware startup.** `-h`/`--help` now prints command-line usage without
-  initializing a model, while `--deepseek` and `--local` select a backend for
+  initializing a model, while `--deepseek`, `--kimi`, `--kimi-code`, and `--local` select a backend for
   the current process. An unavailable Ollama server or model now starts the
   interactive shell in a clearly warned disconnected mode instead of exiting,
-  keeping `/cloudmodel`, `/help`, and direct commands available. DeepSeek's
-  default active harness budget is now 250K within its 1M provider capability.
+  keeping `/cloudmodel`, `/help`, and direct commands available. Hosted models
+  with a 1M provider capability now default to a 950K active harness budget,
+  reserving the final 50K for generation; local Ollama remains at 250K.
 
 - **Report file for every completed task.** Every clean, non-conversational
   `status: done` turn now writes a private Markdown report under `~/reports`,
@@ -56,6 +68,14 @@ All notable changes to the SecorizonAI shell are documented here.
   empty-command-streak guard still bounds.
 
 ### Fixed
+
+- **Opaque multi-minute Kimi waits.** Kimi Open Platform and Kimi Code requests
+  now use SSE streaming. The terminal reports that the private reasoning stream
+  is active without exposing its contents, renders answer text as soon as it
+  arrives, preserves reasoning history, and rejects truncated streams missing
+  the provider's `[DONE]` marker. The default reasoning effort is now Kimi's
+  recommended `high`; `max` remains available through `/effort max`. DeepSeek's
+  request path is unchanged.
 
 - **Guide directories and filename-based loading.** First run now creates the
   private `~/.secorizon/guides/` and `~/.secorizon/custom-guides/` directories

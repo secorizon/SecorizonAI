@@ -150,11 +150,17 @@ or bake them into the `environment:` block of `docker-compose.yml`:
 |---|---|
 | `OLLAMA_URL` | Where to reach Ollama (default `http://host.docker.internal:11434`) |
 | `SECORIZON_MODEL` | Model tag (Compose default `secorizon:latest`; binary default `secorizon:v2`) |
-| `SECORIZON_MODEL_BACKEND` | Temporary backend override: `local` or `deepseek` |
-| `SECORIZON_CLOUD_MODEL` | DeepSeek model override (default `deepseek-v4-flash`) |
+| `SECORIZON_MODEL_BACKEND` | Temporary backend override: `local`, `deepseek`, `kimi`, or `kimi-code` |
+| `SECORIZON_CLOUD_PROVIDER` | Optional cloud-provider override: `deepseek`, `kimi`, or `kimi-code` |
+| `SECORIZON_CLOUD_MODEL` | Cloud model override (`deepseek-v4-flash`, `kimi-k3`, or Kimi Code `k3`) |
 | `DEEPSEEK_API_KEY` | DeepSeek credential for non-interactive/temporary cloud selection |
 | `DEEPSEEK_BASE_URL` | DeepSeek-compatible HTTPS endpoint (default `https://api.deepseek.com`) |
-| `SECORIZON_NUM_CTX` | Context window in tokens (binary default `250000`). E.g. `SECORIZON_NUM_CTX=16384` for tight VRAM. |
+| `MOONSHOT_API_KEY` | Kimi credential (`KIMI_API_KEY` is also accepted) |
+| `MOONSHOT_BASE_URL` | Kimi HTTPS endpoint (default `https://api.moonshot.ai/v1`; `KIMI_BASE_URL` is also accepted) |
+| `KIMI_CODE_API_KEY` | Kimi Code Console credential; separate from an Open Platform key |
+| `KIMI_CODE_BASE_URL` | Kimi Code subscription endpoint (default `https://api.kimi.com/coding/v1`) |
+| `KIMI_REASONING_EFFORT` | Kimi K3 reasoning depth: `low`, `high` (default), or `max` |
+| `SECORIZON_NUM_CTX` | Context window or hosted harness budget in tokens (local default `250000`; 1M hosted models default to `950000`). E.g. `SECORIZON_NUM_CTX=16384` for tight VRAM. |
 | `SECORIZON_KEEP_ALIVE` | Per-request keep_alive (default `24h`). Pins the model in VRAM across turns. |
 | `SECORIZON_CONFIG_DIR` | Override `~/.secorizon/` location inside the container. Pre-set to point at the mounted host config. |
 | `BURP_MCP_URL` | Default Burp MCP endpoint (only consulted when you run `/burp`). |
@@ -168,17 +174,37 @@ docker compose run --rm \
   secorizon
 ```
 
-To opt into DeepSeek interactively, run
-`/cloudmodel deepseek deepseek-v4-flash` in the shell; the masked credential and
+To opt into a cloud provider interactively, run
+`/cloudmodel deepseek deepseek-v4-flash`, `/cloudmodel kimi kimi-k3`, or
+`/cloudmodel kimi-code k3` in the shell; the masked credential and
 persistent backend selection are stored in the mounted
 `./secorizon-config/` directory. In cloud mode,
-conversation context and tool results are sent to DeepSeek, but commands still
+conversation context and tool results are sent to the selected provider, but commands still
 run inside the container. A non-persistent one-liner is:
 
 ```bash
 docker compose run --rm \
   -e SECORIZON_MODEL_BACKEND=deepseek \
   -e DEEPSEEK_API_KEY='<key>' \
+  secorizon
+```
+
+The Kimi Open Platform equivalent is:
+
+```bash
+docker compose run --rm \
+  -e SECORIZON_MODEL_BACKEND=kimi \
+  -e MOONSHOT_API_KEY='<key>' \
+  secorizon
+```
+
+That command expects a Kimi Open Platform key. For a Kimi Code subscription
+key, use the distinct provider:
+
+```bash
+docker compose run --rm \
+  -e SECORIZON_MODEL_BACKEND=kimi-code \
+  -e KIMI_CODE_API_KEY='<key>' \
   secorizon
 ```
 

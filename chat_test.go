@@ -23,6 +23,20 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
 	return fn(request)
 }
 
+func cloudSSEBody(t *testing.T, events ...map[string]interface{}) string {
+	t.Helper()
+	var body strings.Builder
+	for _, event := range events {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&body, "data: %s\n\n", encoded)
+	}
+	body.WriteString("data: [DONE]\n\n")
+	return body.String()
+}
+
 func TestParseCLIOptions(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -35,8 +49,11 @@ func TestParseCLIOptions(t *testing.T) {
 		{name: "short help", args: []string{"-h"}, wantHelp: true},
 		{name: "long help", args: []string{"--help"}, wantHelp: true},
 		{name: "deepseek", args: []string{"--deepseek"}, wantBackend: deepSeekProvider},
+		{name: "kimi", args: []string{"--kimi"}, wantBackend: kimiProvider},
+		{name: "kimi code", args: []string{"--kimi-code"}, wantBackend: kimiCodeProvider},
 		{name: "local", args: []string{"--local"}, wantBackend: localModelBackend},
 		{name: "conflict", args: []string{"--deepseek", "--local"}, wantError: true},
+		{name: "cloud conflict", args: []string{"--deepseek", "--kimi"}, wantError: true},
 		{name: "unknown", args: []string{"--wat"}, wantError: true},
 	}
 	for _, test := range tests {
@@ -55,10 +72,64 @@ func TestParseCLIOptions(t *testing.T) {
 func TestCLIUsageExplainsOfflineDeepSeekStartup(t *testing.T) {
 	var output strings.Builder
 	printCLIUsage(&output)
-	for _, want := range []string{"--deepseek", "Ollama is not required", "/cloudmodel deepseek", "SECORIZON_MODEL_BACKEND=deepseek"} {
+	for _, want := range []string{
+		"--deepseek", "/cloudmodel deepseek", "SECORIZON_MODEL_BACKEND=deepseek",
+		"--kimi", "/cloudmodel kimi", "MOONSHOT_API_KEY", "Ollama is not required",
+		"--kimi-code", "/cloudmodel kimi-code k3", "KIMI_CODE_API_KEY",
+	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("CLI usage omitted %q:\n%s", want, output.String())
 		}
+	}
+}
+
+func TestKimiCLIOverrideUsesKimiEnvironment(t *testing.T) {
+	oldBackend, oldProvider, oldModel := modelBackend, cloudProvider, model
+	oldCloudModel, oldBaseURL, oldAPIKey := cloudModel, cloudBaseURL, cloudAPIKey
+	defer func() {
+		modelBackend, cloudProvider, model = oldBackend, oldProvider, oldModel
+		cloudModel, cloudBaseURL, cloudAPIKey = oldCloudModel, oldBaseURL, oldAPIKey
+	}()
+	t.Setenv("SECORIZON_CLOUD_MODEL", "kimi-k3-custom")
+	t.Setenv("MOONSHOT_BASE_URL", "https://api.moonshot.test/v1/")
+	t.Setenv("MOONSHOT_API_KEY", "secret-kimi-env-key")
+	cloudProvider = deepSeekProvider
+	cloudModel = deepSeekDefaultModel
+	cloudBaseURL = deepSeekDefaultBaseURL
+
+	if err := applyCLIBackendOverride(kimiProvider); err != nil {
+		t.Fatal(err)
+	}
+	if modelBackend != kimiProvider || cloudProvider != kimiProvider || model != "kimi-k3-custom" {
+		t.Fatalf("Kimi CLI override = backend %q, provider %q, model %q", modelBackend, cloudProvider, model)
+	}
+	if cloudBaseURL != "https://api.moonshot.test/v1" || cloudAPIKey != "secret-kimi-env-key" {
+		t.Fatalf("Kimi environment = base %q, key %q", cloudBaseURL, cloudAPIKey)
+	}
+}
+
+func TestKimiCodeCLIOverrideUsesSubscriptionEnvironment(t *testing.T) {
+	oldBackend, oldProvider, oldModel := modelBackend, cloudProvider, model
+	oldCloudModel, oldBaseURL, oldAPIKey := cloudModel, cloudBaseURL, cloudAPIKey
+	defer func() {
+		modelBackend, cloudProvider, model = oldBackend, oldProvider, oldModel
+		cloudModel, cloudBaseURL, cloudAPIKey = oldCloudModel, oldBaseURL, oldAPIKey
+	}()
+	t.Setenv("SECORIZON_CLOUD_MODEL", "")
+	t.Setenv("KIMI_CODE_BASE_URL", "https://api.kimi.test/coding/v1/")
+	t.Setenv("KIMI_CODE_API_KEY", "secret-kimi-code-key")
+	cloudProvider = kimiProvider
+	cloudModel = kimiDefaultModel
+	cloudBaseURL = kimiDefaultBaseURL
+
+	if err := applyCLIBackendOverride(kimiCodeProvider); err != nil {
+		t.Fatal(err)
+	}
+	if modelBackend != kimiCodeProvider || cloudProvider != kimiCodeProvider || model != kimiCodeDefaultModel {
+		t.Fatalf("Kimi Code CLI override = backend %q, provider %q, model %q", modelBackend, cloudProvider, model)
+	}
+	if cloudBaseURL != "https://api.kimi.test/coding/v1" || cloudAPIKey != "secret-kimi-code-key" {
+		t.Fatalf("Kimi Code environment = base %q, key %q", cloudBaseURL, cloudAPIKey)
 	}
 }
 
@@ -68,10 +139,32 @@ func TestDisplayContextKPreservesDecimalAndBinaryBudgets(t *testing.T) {
 		65_536:  64,
 		131_072: 128,
 		250_000: 250,
+		950_000: 950,
 	}
 	for tokens, want := range tests {
 		if got := displayContextK(tokens); got != want {
 			t.Fatalf("displayContextK(%d) = %d, want %d", tokens, got, want)
+		}
+	}
+	if got := cloudContextCapabilityLabel(kimiCodeProvider, kimiCodeContextTokens); !strings.Contains(got, "membership-dependent") {
+		t.Fatalf("Kimi Code capability label = %q", got)
+	}
+}
+
+func TestBackendContextBudgetsReserveCloudGenerationHeadroom(t *testing.T) {
+	if localContextTokens != 250_000 {
+		t.Fatalf("local context = %d, want 250000", localContextTokens)
+	}
+	for _, provider := range []string{deepSeekProvider, kimiProvider, kimiCodeProvider} {
+		_, _, capability, budget, ok := cloudProviderDefaults(provider)
+		if !ok {
+			t.Fatalf("provider %q has no defaults", provider)
+		}
+		if capability != 1_000_000 || budget != 950_000 {
+			t.Fatalf("provider %q capability/budget = %d/%d, want 1000000/950000", provider, capability, budget)
+		}
+		if capability-budget != cloudContextHeadroomTokens {
+			t.Fatalf("provider %q headroom = %d, want %d", provider, capability-budget, cloudContextHeadroomTokens)
 		}
 	}
 }
@@ -878,6 +971,224 @@ func TestDeepSeekChatUsesV4JSONProtocolAndUsage(t *testing.T) {
 	}
 }
 
+func TestKimiChatUsesK3ProtocolAndPreservesReasoning(t *testing.T) {
+	oldBackend, oldProvider, oldModel := modelBackend, cloudProvider, model
+	oldBaseURL, oldAPIKey := cloudBaseURL, cloudAPIKey
+	oldClient, oldEffort := kimiHTTPClient, kimiReasoningEffort
+	lastAssistantReasoningMu.Lock()
+	oldReasoning := lastAssistantReasoning
+	lastAssistantReasoningMu.Unlock()
+	defer func() {
+		modelBackend, cloudProvider, model = oldBackend, oldProvider, oldModel
+		cloudBaseURL, cloudAPIKey = oldBaseURL, oldAPIKey
+		kimiHTTPClient, kimiReasoningEffort = oldClient, oldEffort
+		setLastAssistantReasoning(oldReasoning)
+	}()
+
+	calls := 0
+	var requests []map[string]interface{}
+	kimiHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.URL.String() != "https://api.moonshot.test/v1/chat/completions" {
+			t.Fatalf("unexpected Kimi URL: %s", r.URL)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-kimi-key" {
+			t.Fatalf("authorization header = %q", got)
+		}
+		var received map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, received)
+
+		content := `{"text":"continue","command":"","search":"","status":"done"}`
+		events := make([]map[string]interface{}, 0, 3)
+		if calls == 1 {
+			events = append(events, map[string]interface{}{
+				"model": kimiDefaultModel,
+				"choices": []interface{}{map[string]interface{}{
+					"delta": map[string]interface{}{"role": "assistant", "reasoning_content": "private K3 plan"},
+				}},
+			})
+		}
+		events = append(events,
+			map[string]interface{}{
+				"model": kimiDefaultModel,
+				"choices": []interface{}{map[string]interface{}{
+					"delta": map[string]interface{}{"content": content},
+				}},
+			},
+			map[string]interface{}{
+				"model": kimiDefaultModel,
+				"choices": []interface{}{map[string]interface{}{
+					"delta": map[string]interface{}{}, "finish_reason": "stop",
+				}},
+				"usage": map[string]interface{}{"prompt_tokens": 200, "completion_tokens": 25},
+			},
+		)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(cloudSSEBody(t, events...))),
+		}, nil
+	})}
+	modelBackend = kimiProvider
+	cloudProvider = kimiProvider
+	model = kimiDefaultModel
+	cloudBaseURL = "https://api.moonshot.test/v1"
+	cloudAPIKey = "secret-kimi-key"
+	kimiReasoningEffort = "high"
+
+	initial := []message{{Role: "system", Content: technicalPrompt}, {Role: "user", Content: "review this"}}
+	result, interrupted := kimiChat(initial)
+	if interrupted {
+		t.Fatal("Kimi turn was unexpectedly interrupted")
+	}
+	assistant := assistantMessageForResponse(result)
+	if assistant.ReasoningContent != "private K3 plan" {
+		t.Fatalf("Kimi reasoning was not retained: %#v", assistant)
+	}
+	continued := append(initial, assistant, message{Role: "user", Content: "continue"})
+	if _, interrupted := kimiChat(continued); interrupted {
+		t.Fatal("continued Kimi turn was unexpectedly interrupted")
+	}
+
+	if calls != 2 || len(requests) != 2 {
+		t.Fatalf("Kimi calls = %d, requests = %d", calls, len(requests))
+	}
+	first := requests[0]
+	if first["model"] != kimiDefaultModel || first["stream"] != true {
+		t.Fatalf("request envelope = %#v", first)
+	}
+	if _, present := first["thinking"]; present {
+		t.Fatalf("Kimi request incorrectly included DeepSeek thinking control: %#v", first["thinking"])
+	}
+	if first["reasoning_effort"] != "high" {
+		t.Fatalf("reasoning_effort = %#v", first["reasoning_effort"])
+	}
+	if first["response_format"].(map[string]interface{})["type"] != "json_object" {
+		t.Fatalf("response format = %#v", first["response_format"])
+	}
+	continuedMessages := requests[1]["messages"].([]interface{})
+	historicalAssistant := continuedMessages[2].(map[string]interface{})
+	if historicalAssistant["reasoning_content"] != "private K3 plan" {
+		t.Fatalf("continued request omitted K3 reasoning history: %#v", historicalAssistant)
+	}
+}
+
+func TestKimiCodeChatUsesSubscriptionEndpointAndModel(t *testing.T) {
+	oldBackend, oldProvider, oldModel := modelBackend, cloudProvider, model
+	oldBaseURL, oldAPIKey := cloudBaseURL, cloudAPIKey
+	oldClient, oldEffort := kimiHTTPClient, kimiReasoningEffort
+	defer func() {
+		modelBackend, cloudProvider, model = oldBackend, oldProvider, oldModel
+		cloudBaseURL, cloudAPIKey = oldBaseURL, oldAPIKey
+		kimiHTTPClient, kimiReasoningEffort = oldClient, oldEffort
+		setLastAssistantReasoning("")
+	}()
+
+	var received map[string]interface{}
+	kimiHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != "https://api.kimi.test/coding/v1/chat/completions" {
+			t.Fatalf("unexpected Kimi Code URL: %s", r.URL)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-kimi-code-key" {
+			t.Fatalf("authorization header = %q", got)
+		}
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Fatalf("accept header = %q", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		content := `{"text":"ready","command":"","search":"","status":"done"}`
+		body := cloudSSEBody(t,
+			map[string]interface{}{
+				"model": kimiCodeDefaultModel,
+				"choices": []interface{}{map[string]interface{}{
+					"delta": map[string]interface{}{"role": "assistant", "reasoning_content": "subscription plan"},
+				}},
+			},
+			map[string]interface{}{
+				"model": kimiCodeDefaultModel,
+				"choices": []interface{}{map[string]interface{}{
+					"delta": map[string]interface{}{"content": content},
+				}},
+			},
+			map[string]interface{}{
+				"model": kimiCodeDefaultModel,
+				"choices": []interface{}{map[string]interface{}{
+					"delta": map[string]interface{}{}, "finish_reason": "stop",
+				}},
+				"usage": map[string]interface{}{"prompt_tokens": 50, "completion_tokens": 10},
+			},
+		)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	modelBackend = kimiCodeProvider
+	cloudProvider = kimiCodeProvider
+	model = kimiCodeDefaultModel
+	cloudBaseURL = "https://api.kimi.test/coding/v1"
+	cloudAPIKey = "secret-kimi-code-key"
+	kimiReasoningEffort = "max"
+
+	result, interrupted := kimiCodeChat([]message{{Role: "user", Content: "hello"}})
+	if interrupted || parseModelResponse(result).Status != "done" {
+		t.Fatalf("Kimi Code result = %q, interrupted=%v", result, interrupted)
+	}
+	if received["model"] != kimiCodeDefaultModel || received["reasoning_effort"] != "max" {
+		t.Fatalf("Kimi Code request = %#v", received)
+	}
+	if received["stream"] != true {
+		t.Fatalf("Kimi Code streaming = %#v", received["stream"])
+	}
+	if _, present := received["thinking"]; present {
+		t.Fatalf("Kimi Code request incorrectly included DeepSeek thinking control: %#v", received["thinking"])
+	}
+	if got := assistantMessageForResponse(result).ReasoningContent; got != "subscription plan" {
+		t.Fatalf("Kimi Code reasoning = %q", got)
+	}
+}
+
+func TestReadCloudChatSSERejectsTruncatedStreamAndKeepsPartialDeltas(t *testing.T) {
+	body := strings.Join([]string{
+		`: keep-alive`,
+		`data: {"model":"k3","choices":[{"delta":{"reasoning_content":"private plan"}}]}`,
+		``,
+		`data: {"model":"k3","choices":[{"delta":{"content":"partial answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3}}`,
+		``,
+	}, "\n")
+	var visible strings.Builder
+	result, err := readCloudChatSSE(strings.NewReader(body), func(_, content string) {
+		visible.WriteString(content)
+	})
+	if err == nil || !strings.Contains(err.Error(), "before [DONE]") {
+		t.Fatalf("truncated stream error = %v", err)
+	}
+	if result.Content != "partial answer" || result.Reasoning != "private plan" || result.Model != "k3" {
+		t.Fatalf("partial stream result = %#v", result)
+	}
+	if visible.String() != "partial answer" || result.Usage.PromptTokens != 9 || result.FinishReason != "stop" {
+		t.Fatalf("partial stream metadata = %#v, visible = %q", result, visible.String())
+	}
+}
+
+func TestKimiAuthenticationHintsDistinguishProducts(t *testing.T) {
+	openHint := cloudAuthenticationHint(kimiProvider, http.StatusUnauthorized)
+	if !strings.Contains(openHint, "platform.kimi.ai") || !strings.Contains(openHint, "/cloudmodel kimi-code k3") {
+		t.Fatalf("Open Platform hint = %q", openHint)
+	}
+	codeHint := cloudAuthenticationHint(kimiCodeProvider, http.StatusUnauthorized)
+	if !strings.Contains(codeHint, "Kimi Code Console") || !strings.Contains(codeHint, "/cloudmodel kimi kimi-k3") {
+		t.Fatalf("Kimi Code hint = %q", codeHint)
+	}
+	if hint := cloudAuthenticationHint(kimiProvider, http.StatusForbidden); hint != "" {
+		t.Fatalf("unexpected non-401 hint = %q", hint)
+	}
+}
+
 func TestCloudAPIKeyNormalizationAndStoredCredentialMigration(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("SECORIZON_CONFIG_DIR", stateDir)
@@ -913,6 +1224,34 @@ func TestCloudAPIKeyNormalizationAndStoredCredentialMigration(t *testing.T) {
 	}
 	if _, _, err := normalizeCloudAPIKey("sk-invalid-" + string(rune(0x1f4a5))); err == nil {
 		t.Fatal("non-ASCII credential was accepted for an HTTP header")
+	}
+}
+
+func TestCloudCredentialsRemainSeparateByProvider(t *testing.T) {
+	t.Setenv("SECORIZON_CONFIG_DIR", t.TempDir())
+	if err := saveCloudAPIKey(deepSeekProvider, "secret-deepseek-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCloudAPIKey(kimiProvider, "secret-kimi-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCloudAPIKey(kimiCodeProvider, "secret-kimi-code-key"); err != nil {
+		t.Fatal(err)
+	}
+	deepSeekKey, err := loadCloudAPIKey(deepSeekProvider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kimiKey, err := loadCloudAPIKey(kimiProvider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kimiCodeKey, err := loadCloudAPIKey(kimiCodeProvider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deepSeekKey != "secret-deepseek-key" || kimiKey != "secret-kimi-key" || kimiCodeKey != "secret-kimi-code-key" {
+		t.Fatalf("provider credentials crossed: deepseek=%q kimi=%q kimi-code=%q", deepSeekKey, kimiKey, kimiCodeKey)
 	}
 }
 
@@ -1023,6 +1362,58 @@ func TestDeepSeekSettingsAndCredentialPersistence(t *testing.T) {
 	}
 }
 
+func TestKimiSettingsPersistenceAndDeepSeekOverride(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("SECORIZON_CONFIG_DIR", stateDir)
+	for _, key := range []string{
+		"SECORIZON_MODEL_BACKEND", "SECORIZON_CLOUD_PROVIDER", "SECORIZON_MODEL", "OLLAMA_URL",
+		"SECORIZON_CLOUD_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
+		"MOONSHOT_BASE_URL", "MOONSHOT_API_KEY", "KIMI_BASE_URL", "KIMI_API_KEY",
+		"KIMI_CODE_BASE_URL", "KIMI_CODE_API_KEY",
+	} {
+		t.Setenv(key, "")
+	}
+
+	oldBackend, oldModel, oldOllamaURL := modelBackend, model, ollamaURL
+	oldLocalModel, oldLocalURL := localModel, localOllamaURL
+	oldProvider, oldCloudModel := cloudProvider, cloudModel
+	oldCloudBase, oldCloudKey := cloudBaseURL, cloudAPIKey
+	defer func() {
+		modelBackend, model, ollamaURL = oldBackend, oldModel, oldOllamaURL
+		localModel, localOllamaURL = oldLocalModel, oldLocalURL
+		cloudProvider, cloudModel = oldProvider, oldCloudModel
+		cloudBaseURL, cloudAPIKey = oldCloudBase, oldCloudKey
+	}()
+
+	settings := persistedModelSettings{
+		Backend: kimiProvider, LocalModel: "secorizon:v3-q4km", OllamaURL: "http://10.8.0.4:11434",
+		CloudProvider: kimiProvider, CloudModel: kimiDefaultModel, CloudBaseURL: kimiDefaultBaseURL,
+	}
+	if err := savePersistedModelSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCloudAPIKey(kimiProvider, "secret-persisted-kimi-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCloudAPIKey(deepSeekProvider, "secret-persisted-deepseek-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPersistentModelSelection(); err != nil {
+		t.Fatal(err)
+	}
+	if modelBackend != kimiProvider || cloudProvider != kimiProvider || model != kimiDefaultModel || cloudAPIKey != "secret-persisted-kimi-key" {
+		t.Fatalf("persistent Kimi selection not restored: backend=%q provider=%q model=%q key=%q", modelBackend, cloudProvider, model, cloudAPIKey)
+	}
+
+	t.Setenv("SECORIZON_MODEL_BACKEND", deepSeekProvider)
+	if err := applyPersistentModelSelection(); err != nil {
+		t.Fatal(err)
+	}
+	if modelBackend != deepSeekProvider || cloudProvider != deepSeekProvider || model != deepSeekDefaultModel || cloudAPIKey != "secret-persisted-deepseek-key" {
+		t.Fatalf("DeepSeek override regressed: backend=%q provider=%q model=%q key=%q", modelBackend, cloudProvider, model, cloudAPIKey)
+	}
+}
+
 func TestDeepSeekConfigurationRequiresHTTPSAndRedactsErrors(t *testing.T) {
 	if err := validateDeepSeekEndpoint("http://api.deepseek.com"); err == nil {
 		t.Fatal("insecure DeepSeek endpoint was accepted")
@@ -1030,6 +1421,30 @@ func TestDeepSeekConfigurationRequiresHTTPSAndRedactsErrors(t *testing.T) {
 	got := boundedCloudError([]byte(`{"error":"rejected secret-error-key"}`), "secret-error-key")
 	if strings.Contains(got, "secret-error-key") || !strings.Contains(got, "[redacted]") {
 		t.Fatalf("credential was not redacted: %q", got)
+	}
+}
+
+func TestKimiConfigurationRequiresHTTPSAndValidEffort(t *testing.T) {
+	if err := validateCloudEndpoint(kimiProvider, "http://api.moonshot.ai/v1"); err == nil {
+		t.Fatal("insecure Kimi endpoint was accepted")
+	}
+	for _, effort := range []string{"low", "high", "max"} {
+		if err := validateKimiReasoningEffort(effort); err != nil {
+			t.Fatalf("valid Kimi reasoning effort %q rejected: %v", effort, err)
+		}
+	}
+	if err := validateKimiReasoningEffort("medium"); err == nil {
+		t.Fatal("unsupported Kimi reasoning effort was accepted")
+	}
+}
+
+func TestKimiCodeSettingsUseSubscriptionDefaults(t *testing.T) {
+	settings, err := normalizePersistedModelSettings(persistedModelSettings{Backend: kimiCodeProvider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.CloudProvider != kimiCodeProvider || settings.CloudModel != "k3" || settings.CloudBaseURL != kimiCodeDefaultBaseURL {
+		t.Fatalf("Kimi Code defaults = %#v", settings)
 	}
 }
 

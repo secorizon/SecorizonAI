@@ -4,9 +4,10 @@
 // https://secorizon.com
 // twitter.com/secorizon
 //
-// A single-binary, terminal-native interface for running an AI agent backed by a
-// locally-served LLM (via Ollama). Implements a structured-JSON tool-use loop
-// (ReAct pattern) with shell access, web search, and optional MCP integration.
+// A single-binary, terminal-native interface for running an AI agent backed by
+// local Ollama or an explicitly selected cloud provider. Implements a
+// structured-JSON tool-use loop (ReAct pattern) with shell access, web search,
+// and optional MCP integration.
 
 package main
 
@@ -49,13 +50,25 @@ const (
 	cYellow = "\033[93m"
 	cCyan   = "\033[96m"
 
-	localModelBackend      = "local"
-	deepSeekProvider       = "deepseek"
-	deepSeekDefaultBaseURL = "https://api.deepseek.com"
-	deepSeekDefaultModel   = "deepseek-v4-flash"
-	deepSeekContextTokens  = 1_000_000
-	deepSeekPromptBudget   = 250_000
-	modelSettingsVersion   = 1
+	localModelBackend          = "local"
+	deepSeekProvider           = "deepseek"
+	deepSeekDefaultBaseURL     = "https://api.deepseek.com"
+	deepSeekDefaultModel       = "deepseek-v4-flash"
+	deepSeekContextTokens      = 1_000_000
+	deepSeekPromptBudget       = deepSeekContextTokens - cloudContextHeadroomTokens
+	kimiProvider               = "kimi"
+	kimiDefaultBaseURL         = "https://api.moonshot.ai/v1"
+	kimiDefaultModel           = "kimi-k3"
+	kimiContextTokens          = 1_000_000
+	kimiPromptBudget           = kimiContextTokens - cloudContextHeadroomTokens
+	kimiCodeProvider           = "kimi-code"
+	kimiCodeDefaultBaseURL     = "https://api.kimi.com/coding/v1"
+	kimiCodeDefaultModel       = "k3"
+	kimiCodeContextTokens      = 1_000_000
+	kimiCodePromptBudget       = kimiCodeContextTokens - cloudContextHeadroomTokens
+	cloudContextHeadroomTokens = 50_000
+	localContextTokens         = 250_000
+	modelSettingsVersion       = 1
 )
 
 // ── Globals ─────────────────────────────────────────────────────────────────
@@ -69,18 +82,21 @@ var (
 		"v2": "secorizon:v2",
 		"v3": "secorizon:v3",
 	}
-	modelBackend       = localModelBackend
-	localModel         = model
-	localOllamaURL     = ollamaURL
-	cloudProvider      = deepSeekProvider
-	cloudModel         = deepSeekDefaultModel
-	cloudBaseURL       = deepSeekDefaultBaseURL
-	cloudAPIKey        string
-	deepSeekHTTPClient = &http.Client{Timeout: 15 * time.Minute}
-	thinkMode          = false
-	fastMode           = false // default: full 250K context. /fast for a smaller, faster ctx.
-	// 250K default gives deep multi-file audits room; /fast or SECORIZON_NUM_CTX lowers it.
-	numCtx               = 250000
+	modelBackend        = localModelBackend
+	localModel          = model
+	localOllamaURL      = ollamaURL
+	cloudProvider       = deepSeekProvider
+	cloudModel          = deepSeekDefaultModel
+	cloudBaseURL        = deepSeekDefaultBaseURL
+	cloudAPIKey         string
+	deepSeekHTTPClient  = &http.Client{Timeout: 15 * time.Minute}
+	kimiHTTPClient      = &http.Client{Timeout: 15 * time.Minute}
+	kimiReasoningEffort = strings.ToLower(envOr("KIMI_REASONING_EFFORT", "high"))
+	thinkMode           = false
+	fastMode            = false // local default: 250K. Hosted 1M providers default to 950K.
+	// Keep local inference at 250K; hosted providers reserve 50K of their 1M
+	// capability for generation while exposing the remaining 950K to the harness.
+	numCtx               = localContextTokens
 	moduleQueue          []auditUnit           // /bymodule: queued audit units, fresh context each (oversized modules auto-split)
 	guidesEnabled        = false               // off by default — explicit /guides <name> to load
 	guidesPrompt         string                // legacy: combined content for /guides all|off
@@ -120,9 +136,11 @@ var (
 	// explicitly handed the output and can't miss it (the previous behavior
 	// only printed `[bg] Command finished` to the terminal, never to the
 	// model, which led to silent loss of recon data).
-	pendingBgResults   []string
-	pendingBgResultsMu sync.Mutex
-	interrupted        bool
+	pendingBgResults         []string
+	pendingBgResultsMu       sync.Mutex
+	interrupted              bool
+	lastAssistantReasoning   string
+	lastAssistantReasoningMu sync.Mutex
 
 	// Burp MCP — disabled by default, enabled with /burp
 	globalBurpMCP *BurpMCP
@@ -2029,6 +2047,103 @@ func cloudCredentialsPath() string {
 	return filepath.Join(modelStateDir(), "cloud-credentials.json")
 }
 
+func cloudProviderDefaults(provider string) (defaultModel, defaultBaseURL string, contextTokens, promptBudget int, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case deepSeekProvider:
+		return deepSeekDefaultModel, deepSeekDefaultBaseURL, deepSeekContextTokens, deepSeekPromptBudget, true
+	case kimiProvider:
+		return kimiDefaultModel, kimiDefaultBaseURL, kimiContextTokens, kimiPromptBudget, true
+	case kimiCodeProvider:
+		return kimiCodeDefaultModel, kimiCodeDefaultBaseURL, kimiCodeContextTokens, kimiCodePromptBudget, true
+	default:
+		return "", "", 0, 0, false
+	}
+}
+
+func isCloudBackendValue(backend string) bool {
+	_, _, _, _, ok := cloudProviderDefaults(backend)
+	return ok
+}
+
+func isCloudBackend() bool { return isCloudBackendValue(modelBackend) }
+
+func isKimiBackendValue(backend string) bool {
+	backend = strings.ToLower(strings.TrimSpace(backend))
+	return backend == kimiProvider || backend == kimiCodeProvider
+}
+
+func cloudProviderDisplayName(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case deepSeekProvider:
+		return "DeepSeek"
+	case kimiProvider:
+		return "Kimi Open Platform"
+	case kimiCodeProvider:
+		return "Kimi Code"
+	default:
+		return provider
+	}
+}
+
+func validateKimiReasoningEffort(effort string) error {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low", "high", "max":
+		return nil
+	default:
+		return fmt.Errorf("Kimi reasoning effort must be low, high, or max; got %q", effort)
+	}
+}
+
+func activeCloudContext() (contextTokens, promptBudget int) {
+	_, _, contextTokens, promptBudget, ok := cloudProviderDefaults(cloudProvider)
+	if !ok {
+		return deepSeekContextTokens, deepSeekPromptBudget
+	}
+	return contextTokens, promptBudget
+}
+
+func cloudContextCapabilityLabel(provider string, contextTokens int) string {
+	if provider == kimiCodeProvider {
+		return fmt.Sprintf("up to %dK (membership-dependent)", displayContextK(contextTokens))
+	}
+	return fmt.Sprintf("%dK", displayContextK(contextTokens))
+}
+
+func cloudEnvironmentAPIKey(provider string) (value, variable string) {
+	switch provider {
+	case deepSeekProvider:
+		return os.Getenv("DEEPSEEK_API_KEY"), "DEEPSEEK_API_KEY"
+	case kimiProvider:
+		if value := os.Getenv("MOONSHOT_API_KEY"); strings.TrimSpace(value) != "" {
+			return value, "MOONSHOT_API_KEY"
+		}
+		return os.Getenv("KIMI_API_KEY"), "KIMI_API_KEY"
+	case kimiCodeProvider:
+		if value := os.Getenv("KIMI_CODE_API_KEY"); strings.TrimSpace(value) != "" {
+			return value, "KIMI_CODE_API_KEY"
+		}
+		return os.Getenv("KIMI_API_KEY"), "KIMI_API_KEY"
+	default:
+		return "", ""
+	}
+}
+
+func cloudEnvironmentBaseURL(provider string) string {
+	switch provider {
+	case deepSeekProvider:
+		return os.Getenv("DEEPSEEK_BASE_URL")
+	case kimiProvider:
+		if value := os.Getenv("MOONSHOT_BASE_URL"); strings.TrimSpace(value) != "" {
+			return value
+		}
+		return os.Getenv("KIMI_BASE_URL")
+	case kimiCodeProvider:
+		return os.Getenv("KIMI_CODE_BASE_URL")
+	default:
+		return ""
+	}
+}
+
 func normalizePersistedModelSettings(settings persistedModelSettings) (persistedModelSettings, error) {
 	settings.Backend = strings.ToLower(strings.TrimSpace(settings.Backend))
 	settings.LocalModel = strings.TrimSpace(settings.LocalModel)
@@ -2046,21 +2161,29 @@ func normalizePersistedModelSettings(settings persistedModelSettings) (persisted
 		settings.OllamaURL = "http://localhost:11434"
 	}
 	if settings.CloudProvider == "" {
-		settings.CloudProvider = deepSeekProvider
+		if isCloudBackendValue(settings.Backend) {
+			settings.CloudProvider = settings.Backend
+		} else {
+			settings.CloudProvider = deepSeekProvider
+		}
 	}
-	if settings.CloudModel == "" {
-		settings.CloudModel = deepSeekDefaultModel
-	}
-	if settings.CloudBaseURL == "" {
-		settings.CloudBaseURL = deepSeekDefaultBaseURL
-	}
-	if settings.Backend != localModelBackend && settings.Backend != deepSeekProvider {
-		return persistedModelSettings{}, fmt.Errorf("unsupported model backend %q", settings.Backend)
-	}
-	if settings.CloudProvider != deepSeekProvider {
+	defaultCloudModel, defaultCloudBaseURL, _, _, providerOK := cloudProviderDefaults(settings.CloudProvider)
+	if !providerOK {
 		return persistedModelSettings{}, fmt.Errorf("unsupported cloud provider %q", settings.CloudProvider)
 	}
-	if err := validateDeepSeekEndpoint(settings.CloudBaseURL); err != nil {
+	if settings.CloudModel == "" {
+		settings.CloudModel = defaultCloudModel
+	}
+	if settings.CloudBaseURL == "" {
+		settings.CloudBaseURL = defaultCloudBaseURL
+	}
+	if settings.Backend != localModelBackend && !isCloudBackendValue(settings.Backend) {
+		return persistedModelSettings{}, fmt.Errorf("unsupported model backend %q", settings.Backend)
+	}
+	if isCloudBackendValue(settings.Backend) && settings.Backend != settings.CloudProvider {
+		return persistedModelSettings{}, fmt.Errorf("cloud backend %q does not match provider %q", settings.Backend, settings.CloudProvider)
+	}
+	if err := validateCloudEndpoint(settings.CloudProvider, settings.CloudBaseURL); err != nil {
 		return persistedModelSettings{}, err
 	}
 	settings.Version = modelSettingsVersion
@@ -2120,8 +2243,8 @@ func loadCloudCredentials() (persistedCloudCredentials, error) {
 
 func loadCloudAPIKey(provider string) (string, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	if provider == "" {
-		return "", fmt.Errorf("cloud provider is required")
+	if !isCloudBackendValue(provider) {
+		return "", fmt.Errorf("unsupported cloud provider %q", provider)
 	}
 	credentials, err := loadCloudCredentials()
 	if err != nil {
@@ -2192,7 +2315,7 @@ func normalizeCloudAPIKey(raw string) (normalized string, changed bool, err erro
 
 func saveCloudAPIKey(provider, apiKey string) error {
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	if provider != deepSeekProvider {
+	if !isCloudBackendValue(provider) {
 		return fmt.Errorf("unsupported cloud provider %q", provider)
 	}
 	normalized, _, err := normalizeCloudAPIKey(apiKey)
@@ -2207,12 +2330,19 @@ func saveCloudAPIKey(provider, apiKey string) error {
 	return writeCloudCredentials(credentials)
 }
 
-func validateDeepSeekEndpoint(baseURL string) error {
+func validateCloudEndpoint(provider, baseURL string) error {
+	if !isCloudBackendValue(provider) {
+		return fmt.Errorf("unsupported cloud provider %q", provider)
+	}
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return fmt.Errorf("DeepSeek base URL must be an absolute HTTPS URL")
+		return fmt.Errorf("%s base URL must be an absolute HTTPS URL", cloudProviderDisplayName(provider))
 	}
 	return nil
+}
+
+func validateDeepSeekEndpoint(baseURL string) error {
+	return validateCloudEndpoint(deepSeekProvider, baseURL)
 }
 
 func persistCurrentModelSelection() error {
@@ -2222,11 +2352,42 @@ func persistCurrentModelSelection() error {
 	})
 }
 
-// applyPersistentModelSelection mirrors the newer harness's precedence rules:
-// persisted settings are the default; an explicit local model/Ollama URL
-// temporarily selects local inference; explicit backend/cloud variables select
-// DeepSeek without rewriting the persisted choice.
+func loadCloudCredentialForProvider(provider string) (string, error) {
+	apiKey, variable := cloudEnvironmentAPIKey(provider)
+	var err error
+	if strings.TrimSpace(apiKey) == "" {
+		apiKey, err = loadCloudAPIKey(provider)
+		if err != nil {
+			return "", fmt.Errorf("load %s credential: %w", cloudProviderDisplayName(provider), err)
+		}
+		return apiKey, nil
+	}
+	apiKey, _, err = normalizeCloudAPIKey(apiKey)
+	if err != nil {
+		return "", fmt.Errorf("invalid %s: %w", variable, err)
+	}
+	return apiKey, nil
+}
+
+func resetCloudProviderDefaults(provider string) error {
+	defaultModel, defaultBaseURL, _, _, ok := cloudProviderDefaults(provider)
+	if !ok {
+		return fmt.Errorf("unsupported cloud provider %q", provider)
+	}
+	cloudProvider = provider
+	cloudModel = defaultModel
+	cloudBaseURL = defaultBaseURL
+	return nil
+}
+
+// applyPersistentModelSelection uses persisted settings by default. Explicit
+// local model/Ollama variables temporarily select local inference, while the
+// backend/provider/cloud variables can select DeepSeek or Kimi without
+// rewriting the persisted choice.
 func applyPersistentModelSelection() error {
+	if err := validateKimiReasoningEffort(kimiReasoningEffort); err != nil {
+		return err
+	}
 	settings, err := loadPersistedModelSettings()
 	if err != nil {
 		return fmt.Errorf("load persistent model selection: %w", err)
@@ -2245,51 +2406,75 @@ func applyPersistentModelSelection() error {
 	}
 
 	backendOverride := strings.ToLower(strings.TrimSpace(os.Getenv("SECORIZON_MODEL_BACKEND")))
+	providerOverride := strings.ToLower(strings.TrimSpace(os.Getenv("SECORIZON_CLOUD_PROVIDER")))
 	localModelOverride := strings.TrimSpace(os.Getenv("SECORIZON_MODEL")) != ""
 	localURLOverride := strings.TrimSpace(os.Getenv("OLLAMA_URL")) != ""
+	if backendOverride != "" && backendOverride != localModelBackend && !isCloudBackendValue(backendOverride) {
+		return fmt.Errorf("model backend must be local, deepseek, kimi, or kimi-code; got %q", backendOverride)
+	}
+	if providerOverride != "" && !isCloudBackendValue(providerOverride) {
+		return fmt.Errorf("unsupported cloud provider %q", providerOverride)
+	}
+	if isCloudBackendValue(backendOverride) && providerOverride != "" && backendOverride != providerOverride {
+		return fmt.Errorf("cloud backend %q conflicts with provider %q", backendOverride, providerOverride)
+	}
 	if localModelOverride {
 		localModel = strings.TrimSpace(os.Getenv("SECORIZON_MODEL"))
 	}
 	if localURLOverride {
 		localOllamaURL = strings.TrimRight(strings.TrimSpace(os.Getenv("OLLAMA_URL")), "/")
 	}
-	if backendOverride != "" {
+	if isCloudBackendValue(backendOverride) {
+		if cloudProvider != backendOverride {
+			if err := resetCloudProviderDefaults(backendOverride); err != nil {
+				return err
+			}
+		}
 		modelBackend = backendOverride
+		cloudProvider = backendOverride
+	} else if backendOverride == localModelBackend {
+		modelBackend = localModelBackend
 	} else if localModelOverride || localURLOverride {
 		modelBackend = localModelBackend
+	}
+	if providerOverride != "" {
+		if cloudProvider != providerOverride {
+			if err := resetCloudProviderDefaults(providerOverride); err != nil {
+				return err
+			}
+		}
+		cloudProvider = providerOverride
+		if backendOverride == "" {
+			modelBackend = providerOverride
+		}
 	}
 	if value := strings.TrimSpace(os.Getenv("SECORIZON_CLOUD_MODEL")); value != "" {
 		cloudModel = value
 		if backendOverride == "" {
-			modelBackend = deepSeekProvider
+			modelBackend = cloudProvider
 		}
 	}
-	if value := strings.TrimSpace(os.Getenv("DEEPSEEK_BASE_URL")); value != "" {
+	if value := strings.TrimSpace(cloudEnvironmentBaseURL(cloudProvider)); value != "" {
 		cloudBaseURL = strings.TrimRight(value, "/")
 	}
-	if modelBackend != localModelBackend && modelBackend != deepSeekProvider {
-		return fmt.Errorf("model backend must be local or deepseek, got %q", modelBackend)
+	if modelBackend != localModelBackend && !isCloudBackendValue(modelBackend) {
+		return fmt.Errorf("model backend must be local, deepseek, kimi, or kimi-code; got %q", modelBackend)
 	}
-	if cloudProvider != deepSeekProvider {
+	if !isCloudBackendValue(cloudProvider) {
 		return fmt.Errorf("unsupported cloud provider %q", cloudProvider)
 	}
-	if err := validateDeepSeekEndpoint(cloudBaseURL); err != nil {
+	if isCloudBackend() && modelBackend != cloudProvider {
+		return fmt.Errorf("cloud backend %q does not match provider %q", modelBackend, cloudProvider)
+	}
+	if err := validateCloudEndpoint(cloudProvider, cloudBaseURL); err != nil {
 		return err
 	}
-	cloudAPIKey = os.Getenv("DEEPSEEK_API_KEY")
-	if strings.TrimSpace(cloudAPIKey) == "" {
-		cloudAPIKey, err = loadCloudAPIKey(deepSeekProvider)
-		if err != nil {
-			return fmt.Errorf("load DeepSeek credential: %w", err)
-		}
-	} else {
-		cloudAPIKey, _, err = normalizeCloudAPIKey(cloudAPIKey)
-		if err != nil {
-			return fmt.Errorf("invalid DEEPSEEK_API_KEY: %w", err)
-		}
+	cloudAPIKey, err = loadCloudCredentialForProvider(cloudProvider)
+	if err != nil {
+		return err
 	}
 	ollamaURL = localOllamaURL
-	if modelBackend == deepSeekProvider {
+	if isCloudBackend() {
 		model = cloudModel
 	} else {
 		model = localModel
@@ -2339,8 +2524,9 @@ func loadConfig() string {
 // ── Session history ─────────────────────────────────────────────────────────
 
 type message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // History persistence has two synchronization layers:
@@ -4082,22 +4268,135 @@ func withNoThink(messages []message) []message {
 	return out
 }
 
-type deepSeekChatMessage struct {
+type cloudChatMessage struct {
 	Role             string  `json:"role"`
 	Content          *string `json:"content"`
 	ReasoningContent string  `json:"reasoning_content,omitempty"`
 }
 
-type deepSeekChatResponse struct {
+type cloudTokenUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
+type cloudChatResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
-		Message      deepSeekChatMessage `json:"message"`
-		FinishReason string              `json:"finish_reason"`
+		Message      cloudChatMessage `json:"message"`
+		FinishReason string           `json:"finish_reason"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
+	Usage cloudTokenUsage `json:"usage"`
+}
+
+type cloudChatChunk struct {
+	Model   string `json:"model"`
+	Choices []struct {
+		Delta        cloudChatMessage `json:"delta"`
+		FinishReason string           `json:"finish_reason"`
+	} `json:"choices"`
+	Usage cloudTokenUsage `json:"usage"`
+}
+
+type cloudChatStreamResult struct {
+	Content      string
+	Reasoning    string
+	Model        string
+	FinishReason string
+	Usage        cloudTokenUsage
+	SawDone      bool
+}
+
+// readCloudChatSSE parses an OpenAI-compatible Server-Sent Events response.
+// Kimi sends private reasoning_content deltas before answer content deltas and
+// terminates a complete response with `data: [DONE]`. Multiple data lines are
+// joined per the SSE specification so the parser remains correct if an
+// intermediary reformats an event.
+func readCloudChatSSE(r io.Reader, onDelta func(reasoning, content string)) (result cloudChatStreamResult, err error) {
+	var content, reasoning strings.Builder
+	var dataLines []string
+	defer func() {
+		result.Content = content.String()
+		result.Reasoning = reasoning.String()
+	}()
+
+	processEvent := func() error {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		data := strings.TrimSpace(strings.Join(dataLines, "\n"))
+		dataLines = dataLines[:0]
+		if data == "" {
+			return nil
+		}
+		if data == "[DONE]" {
+			result.SawDone = true
+			return nil
+		}
+
+		var chunk cloudChatChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return fmt.Errorf("invalid SSE data: %w", err)
+		}
+		if strings.TrimSpace(chunk.Model) != "" {
+			result.Model = chunk.Model
+		}
+		if chunk.Usage.PromptTokens != 0 || chunk.Usage.CompletionTokens != 0 {
+			result.Usage = chunk.Usage
+		}
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != "" {
+				result.FinishReason = choice.FinishReason
+			}
+			reasoningDelta := choice.Delta.ReasoningContent
+			contentDelta := ""
+			if choice.Delta.Content != nil {
+				contentDelta = *choice.Delta.Content
+			}
+			if reasoningDelta != "" {
+				reasoning.WriteString(reasoningDelta)
+			}
+			if contentDelta != "" {
+				content.WriteString(contentDelta)
+			}
+			if onDelta != nil && (reasoningDelta != "" || contentDelta != "") {
+				onDelta(reasoningDelta, contentDelta)
+			}
+		}
+		return nil
+	}
+
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if err := processEvent(); err != nil {
+				return result, err
+			}
+			if result.SawDone {
+				break
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimPrefix(line, "data:"))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return result, err
+	}
+	if !result.SawDone {
+		if err := processEvent(); err != nil {
+			return result, err
+		}
+	}
+	if !result.SawDone {
+		return result, fmt.Errorf("stream ended before [DONE]")
+	}
+	return result, nil
 }
 
 func boundedCloudError(body []byte, secrets ...string) string {
@@ -4118,17 +4417,58 @@ func boundedCloudError(body []byte, secrets ...string) string {
 
 const modelProviderFailureResponse = `{"text":"","command":"","search":"","status":"question"}`
 
-// deepSeekChat adapts SecorizonAI's existing structured text/command/search
-// protocol to DeepSeek's OpenAI-compatible Chat Completions endpoint. The
-// autonomous executor remains provider-independent: DeepSeek emits the same
-// ModelResponse JSON envelope as Ollama, and the existing loop executes it.
-func deepSeekChat(messages []message, spinners ...*spinner) (string, bool) {
+func setLastAssistantReasoning(reasoning string) {
+	lastAssistantReasoningMu.Lock()
+	lastAssistantReasoning = reasoning
+	lastAssistantReasoningMu.Unlock()
+}
+
+func assistantMessageForResponse(content string) message {
+	lastAssistantReasoningMu.Lock()
+	reasoning := lastAssistantReasoning
+	lastAssistantReasoning = ""
+	lastAssistantReasoningMu.Unlock()
+	return message{Role: "assistant", Content: content, ReasoningContent: reasoning}
+}
+
+func cloudAuthenticationHint(provider string, statusCode int) string {
+	if statusCode != http.StatusUnauthorized {
+		return ""
+	}
+	switch provider {
+	case kimiProvider:
+		return "This endpoint requires a Kimi Open Platform key matching its region (the default is platform.kimi.ai). Kimi Code subscription keys are separate; use /cloudmodel kimi-code k3."
+	case kimiCodeProvider:
+		return "This endpoint requires a Kimi Code Console key and an eligible membership. Open Platform keys are separate; use /cloudmodel kimi kimi-k3."
+	default:
+		return ""
+	}
+}
+
+func cloudHTTPClientFor(provider string) *http.Client {
+	if isKimiBackendValue(provider) {
+		if kimiHTTPClient != nil {
+			return kimiHTTPClient
+		}
+	} else if deepSeekHTTPClient != nil {
+		return deepSeekHTTPClient
+	}
+	return &http.Client{Timeout: 15 * time.Minute}
+}
+
+// cloudChat adapts SecorizonAI's structured text/command/search protocol to
+// OpenAI-compatible Chat Completions providers. Provider-specific reasoning
+// controls stay separate: DeepSeek uses thinking.type, while Kimi K3 always
+// reasons and accepts top-level reasoning_effort.
+func cloudChat(provider string, messages []message, spinners ...*spinner) (string, bool) {
+	setLastAssistantReasoning("")
 	updateHistorySnapshot(messages)
+	providerName := cloudProviderDisplayName(provider)
 	if strings.TrimSpace(cloudAPIKey) == "" {
 		if len(spinners) > 0 && spinners[0] != nil {
 			spinners[0].finish()
 		}
-		fmt.Printf("%s[DeepSeek API key is not configured; use /cloudmodel deepseek]%s\n", cRed, cReset)
+		fmt.Printf("%s[%s API key is not configured; use /cloudmodel %s]%s\n", cRed, providerName, provider, cReset)
 		return modelProviderFailureResponse, false
 	}
 	requestAPIKey, _, keyErr := normalizeCloudAPIKey(cloudAPIKey)
@@ -4136,8 +4476,8 @@ func deepSeekChat(messages []message, spinners ...*spinner) (string, bool) {
 		if len(spinners) > 0 && spinners[0] != nil {
 			spinners[0].finish()
 		}
-		fmt.Printf("%s[DeepSeek credential is invalid: %v; run /cloudmodel deepseek to replace it]%s\n",
-			cRed, keyErr, cReset)
+		fmt.Printf("%s[%s credential is invalid: %v; run /cloudmodel %s to replace it]%s\n",
+			cRed, providerName, keyErr, provider, cReset)
 		return modelProviderFailureResponse, false
 	}
 	cloudAPIKey = requestAPIKey
@@ -4164,47 +4504,53 @@ func deepSeekChat(messages []message, spinners ...*spinner) (string, bool) {
 		}
 	}
 
-	converted := make([]deepSeekChatMessage, 0, len(messages))
+	converted := make([]cloudChatMessage, 0, len(messages))
 	for _, msg := range messages {
 		content := msg.Content
-		converted = append(converted, deepSeekChatMessage{Role: msg.Role, Content: &content})
+		converted = append(converted, cloudChatMessage{
+			Role: msg.Role, Content: &content, ReasoningContent: msg.ReasoningContent,
+		})
 	}
-	payload := struct {
-		Model    string                `json:"model"`
-		Messages []deepSeekChatMessage `json:"messages"`
-		Thinking struct {
-			Type string `json:"type"`
-		} `json:"thinking"`
-		ResponseFormat struct {
-			Type string `json:"type"`
-		} `json:"response_format"`
-		Stream bool `json:"stream"`
-	}{Model: model, Messages: converted, Stream: false}
-	payload.Thinking.Type = "disabled"
-	if thinkMode {
-		payload.Thinking.Type = "enabled"
+	payload := map[string]interface{}{
+		"model":           model,
+		"messages":        converted,
+		"response_format": map[string]string{"type": "json_object"},
+		"stream":          isKimiBackendValue(provider),
 	}
-	payload.ResponseFormat.Type = "json_object"
+	switch provider {
+	case deepSeekProvider:
+		thinkingType := "disabled"
+		if thinkMode {
+			thinkingType = "enabled"
+		}
+		payload["thinking"] = map[string]string{"type": thinkingType}
+	case kimiProvider, kimiCodeProvider:
+		payload["reasoning_effort"] = kimiReasoningEffort
+	default:
+		finishSpinner()
+		fmt.Printf("%s[Unsupported cloud provider: %s]%s\n", cRed, provider, cReset)
+		return modelProviderFailureResponse, false
+	}
 
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		finishSpinner()
-		fmt.Printf("%s[DeepSeek request error: %v]%s\n", cRed, err, cReset)
+		fmt.Printf("%s[%s request error: %v]%s\n", cRed, providerName, err, cReset)
 		return modelProviderFailureResponse, false
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cloudBaseURL, "/")+"/chat/completions", bytes.NewReader(encoded))
 	if err != nil {
 		finishSpinner()
-		fmt.Printf("%s[DeepSeek request error: %v]%s\n", cRed, err, cReset)
+		fmt.Printf("%s[%s request error: %v]%s\n", cRed, providerName, err, cReset)
 		return modelProviderFailureResponse, false
 	}
 	req.Header.Set("Authorization", "Bearer "+requestAPIKey)
 	req.Header.Set("Content-Type", "application/json")
-
-	client := deepSeekHTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Minute}
+	if isKimiBackendValue(provider) {
+		req.Header.Set("Accept", "text/event-stream")
 	}
+
+	client := cloudHTTPClientFor(provider)
 	started := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -4213,32 +4559,116 @@ func deepSeekChat(messages []message, spinners ...*spinner) (string, bool) {
 			fmt.Printf("\n  %s[stopped]%s\n", cRed, cReset)
 			return "", true
 		}
-		fmt.Printf("%s[DeepSeek error: %s]%s\n", cRed, boundedCloudError([]byte(err.Error()), requestAPIKey), cReset)
+		fmt.Printf("%s[%s error: %s]%s\n", cRed, providerName, boundedCloudError([]byte(err.Error()), requestAPIKey), cReset)
 		return modelProviderFailureResponse, false
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		finishSpinner()
+		fmt.Printf("%s[%s returned %s: %s]%s\n", cRed, providerName, resp.Status, boundedCloudError(body, requestAPIKey), cReset)
+		if hint := cloudAuthenticationHint(provider, resp.StatusCode); hint != "" {
+			fmt.Printf("  %s[%s]%s\n", cYellow, hint, cReset)
+		}
+		return modelProviderFailureResponse, false
+	}
+
+	if isKimiBackendValue(provider) {
+		var renderer streamRender
+		spinnerStopped := false
+		contentStarted := false
+		progressVisible := false
+		reasoningChars := 0
+		lastProgressAt := time.Time{}
+		clearProgress := func() {
+			if progressVisible {
+				fmt.Print("\r\033[K")
+				progressVisible = false
+			}
+		}
+		stopSpinner := func() {
+			if !spinnerStopped {
+				finishSpinner()
+				spinnerStopped = true
+			}
+		}
+		onDelta := func(reasoningDelta, contentDelta string) {
+			stopSpinner()
+			if reasoningDelta != "" && !contentStarted {
+				reasoningChars += len(reasoningDelta)
+				now := time.Now()
+				if lastProgressAt.IsZero() || now.Sub(lastProgressAt) >= time.Second {
+					fmt.Printf("\r  %s[Kimi reasoning stream active · %s chars · %s elapsed]%s",
+						cDim, formatShort(reasoningChars), formatTaskDuration(now.Sub(started)), cReset)
+					progressVisible = true
+					lastProgressAt = now
+				}
+			}
+			if contentDelta != "" {
+				if !contentStarted {
+					clearProgress()
+					fmt.Print("\n  ")
+					contentStarted = true
+				}
+				renderer.feed(contentDelta)
+			}
+		}
+
+		streamResult, streamErr := readCloudChatSSE(resp.Body, onDelta)
+		if !spinnerStopped {
+			stopSpinner()
+		}
+		clearProgress()
+		if contentStarted {
+			renderer.finish()
+		}
+		if streamErr != nil {
+			if ctx.Err() != nil {
+				fmt.Printf("\n  %s[stopped]%s\n", cRed, cReset)
+				return streamResult.Content, true
+			}
+			fmt.Printf("%s[%s stream error: %v]%s\n", cRed, providerName, streamErr, cReset)
+			return modelProviderFailureResponse, false
+		}
+		if strings.TrimSpace(streamResult.Content) == "" {
+			fmt.Printf("%s[%s response contained no message content]%s\n", cRed, providerName, cReset)
+			return modelProviderFailureResponse, false
+		}
+
+		setLastAssistantReasoning(streamResult.Reasoning)
+		duration := time.Since(started)
+		totalTokens := streamResult.Usage.PromptTokens + streamResult.Usage.CompletionTokens
+		servedModel := strings.TrimSpace(streamResult.Model)
+		if servedModel == "" {
+			servedModel = model
+		}
+		fmt.Printf("%s[%s]%s %s tokens | prompt %d | gen %d | %.1fs total%s\n",
+			cDim, servedModel, cReset+cDim, formatShort(totalTokens), streamResult.Usage.PromptTokens,
+			streamResult.Usage.CompletionTokens, duration.Seconds(), cReset)
+		if streamResult.FinishReason == "length" {
+			fmt.Printf("  %s[%s stopped at its output/context limit; incomplete JSON will be retried by the agent loop]%s\n", cYellow, providerName, cReset)
+		}
+		return streamResult.Content, false
+	}
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		finishSpinner()
-		fmt.Printf("%s[DeepSeek response error: %v]%s\n", cRed, err, cReset)
+		fmt.Printf("%s[%s response error: %v]%s\n", cRed, providerName, err, cReset)
 		return modelProviderFailureResponse, false
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		finishSpinner()
-		fmt.Printf("%s[DeepSeek returned %s: %s]%s\n", cRed, resp.Status, boundedCloudError(body, requestAPIKey), cReset)
-		return modelProviderFailureResponse, false
-	}
-	var decoded deepSeekChatResponse
+	var decoded cloudChatResponse
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		finishSpinner()
-		fmt.Printf("%s[DeepSeek response decode error: %v]%s\n", cRed, err, cReset)
+		fmt.Printf("%s[%s response decode error: %v]%s\n", cRed, providerName, err, cReset)
 		return modelProviderFailureResponse, false
 	}
 	if len(decoded.Choices) == 0 || decoded.Choices[0].Message.Content == nil {
 		finishSpinner()
-		fmt.Printf("%s[DeepSeek response contained no message content]%s\n", cRed, cReset)
+		fmt.Printf("%s[%s response contained no message content]%s\n", cRed, providerName, cReset)
 		return modelProviderFailureResponse, false
 	}
+	setLastAssistantReasoning(decoded.Choices[0].Message.ReasoningContent)
 	finishSpinner()
 	result := *decoded.Choices[0].Message.Content
 	fmt.Print("\n  ")
@@ -4256,14 +4686,33 @@ func deepSeekChat(messages []message, spinners ...*spinner) (string, bool) {
 		cDim, servedModel, cReset+cDim, formatShort(totalTokens), decoded.Usage.PromptTokens,
 		decoded.Usage.CompletionTokens, duration.Seconds(), cReset)
 	if decoded.Choices[0].FinishReason == "length" {
-		fmt.Printf("  %s[DeepSeek stopped at its output/context limit; incomplete JSON will be retried by the agent loop]%s\n", cYellow, cReset)
+		fmt.Printf("  %s[%s stopped at its output/context limit; incomplete JSON will be retried by the agent loop]%s\n", cYellow, providerName, cReset)
 	}
 	return result, false
 }
 
+func deepSeekChat(messages []message, spinners ...*spinner) (string, bool) {
+	return cloudChat(deepSeekProvider, messages, spinners...)
+}
+
+func kimiChat(messages []message, spinners ...*spinner) (string, bool) {
+	return cloudChat(kimiProvider, messages, spinners...)
+}
+
+func kimiCodeChat(messages []message, spinners ...*spinner) (string, bool) {
+	return cloudChat(kimiCodeProvider, messages, spinners...)
+}
+
 func ollamaChat(messages []message, spinners ...*spinner) (string, bool) {
+	setLastAssistantReasoning("")
 	if modelBackend == deepSeekProvider {
 		return deepSeekChat(messages, spinners...)
+	}
+	if modelBackend == kimiProvider {
+		return kimiChat(messages, spinners...)
+	}
+	if modelBackend == kimiCodeProvider {
+		return kimiCodeChat(messages, spinners...)
 	}
 	// The request slice is stable for the duration of this call. Publish an
 	// immutable checkpoint before blocking on inference so SIGTERM/SIGHUP can
@@ -6053,8 +6502,8 @@ func runCommandWithOptions(cmd string, opts commandRunOptions) string {
 func banner() {
 	// italic is defined globally
 	modelLabel := model
-	if modelBackend == deepSeekProvider {
-		modelLabel = deepSeekProvider + "/" + model
+	if isCloudBackend() {
+		modelLabel = cloudProvider + "/" + model
 	}
 	fmt.Printf(`
   %s%s                          _               %s%s   _    ___
@@ -6090,16 +6539,12 @@ func parseCLIOptions(args []string) (cliOptions, error) {
 		switch arg {
 		case "-h", "--help":
 			options.help = true
-		case "--deepseek":
-			if options.backend == localModelBackend {
-				return cliOptions{}, fmt.Errorf("--deepseek and --local cannot be used together")
+		case "--deepseek", "--kimi", "--kimi-code", "--local":
+			selected := strings.TrimPrefix(arg, "--")
+			if options.backend != "" && options.backend != selected {
+				return cliOptions{}, fmt.Errorf("%s and --%s cannot be used together", arg, options.backend)
 			}
-			options.backend = deepSeekProvider
-		case "--local":
-			if options.backend == deepSeekProvider {
-				return cliOptions{}, fmt.Errorf("--deepseek and --local cannot be used together")
-			}
-			options.backend = localModelBackend
+			options.backend = selected
 		default:
 			return cliOptions{}, fmt.Errorf("unknown option %q", arg)
 		}
@@ -6111,12 +6556,16 @@ func printCLIUsage(w io.Writer) {
 	fmt.Fprint(w, `SecorizonAI v1.3 — terminal security research AI
 
 Usage:
-  secorizon [--deepseek | --local]
+  secorizon [--deepseek | --kimi | --kimi-code | --local]
   secorizon -h | --help
 
 Backend selection:
   --deepseek   Use DeepSeek for this run; Ollama is not required.
                Uses the saved credential, or enter one with /cloudmodel.
+  --kimi       Use Kimi Open Platform for this run; Ollama is not required.
+               Requires an Open Platform key from platform.kimi.ai.
+  --kimi-code  Use Kimi Code for this run; Ollama is not required.
+               Requires a separate Kimi Code Console key and eligible membership.
   --local      Use the remembered Ollama model for this run.
 
 With no selector, SecorizonAI uses the persisted backend (Ollama by default).
@@ -6127,22 +6576,54 @@ First DeepSeek launch:
   ./secorizon --deepseek
   /cloudmodel deepseek deepseek-v4-flash
 
+First Kimi K3 launch:
+  ./secorizon --kimi
+  /cloudmodel kimi kimi-k3
+
+Kimi Code subscription launch:
+  ./secorizon --kimi-code
+  /cloudmodel kimi-code k3
+
 Environment equivalents:
   SECORIZON_MODEL_BACKEND=deepseek ./secorizon
+  SECORIZON_MODEL_BACKEND=kimi MOONSHOT_API_KEY='...' ./secorizon
+  SECORIZON_MODEL_BACKEND=kimi-code KIMI_CODE_API_KEY='...' ./secorizon
+  KIMI_REASONING_EFFORT=high ./secorizon --kimi
   SECORIZON_MODEL_BACKEND=local ./secorizon
 `)
 }
 
-func applyCLIBackendOverride(backend string) {
+func applyCLIBackendOverride(backend string) error {
 	switch backend {
-	case deepSeekProvider:
-		modelBackend = deepSeekProvider
+	case deepSeekProvider, kimiProvider, kimiCodeProvider:
+		if cloudProvider != backend {
+			if err := resetCloudProviderDefaults(backend); err != nil {
+				return err
+			}
+		}
+		modelBackend = backend
+		cloudProvider = backend
+		if value := strings.TrimSpace(os.Getenv("SECORIZON_CLOUD_MODEL")); value != "" {
+			cloudModel = value
+		}
+		if value := strings.TrimSpace(cloudEnvironmentBaseURL(backend)); value != "" {
+			cloudBaseURL = strings.TrimRight(value, "/")
+			if err := validateCloudEndpoint(backend, cloudBaseURL); err != nil {
+				return err
+			}
+		}
+		var err error
+		cloudAPIKey, err = loadCloudCredentialForProvider(backend)
+		if err != nil {
+			return err
+		}
 		model = cloudModel
 	case localModelBackend:
 		modelBackend = localModelBackend
 		model = localModel
 		ollamaURL = localOllamaURL
 	}
+	return nil
 }
 
 func displayContextK(tokens int) int {
@@ -6165,12 +6646,14 @@ func printHelp() {
   %s/clear%s                      Clear conversation context (keeps system prompt)
   %s/model%s [alias|tag]          Show current model, or switch (e.g. /model v2, /model llama3.1:8b).
                               Changes the active local or cloud model.
-  %s/cloudmodel%s deepseek [model] Persistently use DeepSeek (default: deepseek-v4-flash).
+  %s/cloudmodel%s <deepseek|kimi|kimi-code> [model]
+                              kimi = Open Platform; kimi-code = subscription API.
                               Prompts for a masked API key; blank keeps the saved key.
   %s/localmodel%s [model]          Persistently switch back to Ollama.
   %s/think%s                      Toggle provider-native/prompt-based Think++ reasoning.
+  %s/effort%s [low|high|max]      Show or set Kimi K3 reasoning effort (default: high).
   %s/fast%s                       Toggle fast mode. Local: GPU-sized/250K context.
-                              DeepSeek: 16K/250K active harness budget.
+                              Cloud: 16K/950K active harness budget for 1M models.
   %s/ctx%s [N]                    Show or set context window (e.g. /ctx 16k, /ctx 65536, /ctx 250k).
                               Range 2048–1M. Local shrink reloads Ollama; cloud changes the harness budget.
   %s/guides%s [name|all|off]      Load a methodology guide on-demand (off by default).
@@ -6189,14 +6672,14 @@ func printHelp() {
   %s!<command>%s                  Run a shell command directly (no AI involvement)
   %s/exit%s                       Save session log + input history and exit
 
-%s  Stats: Ollama shows throughput/load; DeepSeek shows provider prompt/gen token counts.%s
+%s  Stats: Ollama shows throughput/load; cloud APIs show provider token counts.%s
 %s  Every backend reports the served model, total tokens, and wall-clock time.%s
 %s  Press Ctrl+C to interrupt a command or model stream. /exit (or Ctrl+D ×2) to quit.%s
 
 `, cBold, cCyan, cReset, // banner
 		cBold, cReset, cBold, cReset, cBold, cReset, // /help, /clear, /model
 		cBold, cReset, cBold, cReset, // /cloudmodel, /localmodel
-		cBold, cReset, // /think
+		cBold, cReset, cBold, cReset, // /think, /effort
 		cBold, cReset, cBold, cReset, cBold, cReset, // /fast, /ctx, /guides
 		cBold, cReset, // /burp
 		cBold, cReset, cBold, cReset, // /sessions, /resume
@@ -6246,7 +6729,10 @@ func main() {
 		fmt.Printf("  %sModel configuration error: %v%s\n", cRed, err, cReset)
 		return
 	}
-	applyCLIBackendOverride(cli.backend)
+	if err := applyCLIBackendOverride(cli.backend); err != nil {
+		fmt.Printf("  %sModel configuration error: %v%s\n", cRed, err, cReset)
+		return
+	}
 	banner()
 	remoteOllama := ollamaServerIsRemote(ollamaURL)
 	gpus := gpuInfo{}
@@ -6254,14 +6740,14 @@ func main() {
 
 	if modelBackend == localModelBackend {
 		// Check Ollama connection only for the local backend. A persisted
-		// DeepSeek selection must start without a local/remote Ollama daemon.
+		// Cloud selection must start without a local/remote Ollama daemon.
 		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Get(ollamaURL + "/api/tags")
 		if err != nil {
 			fmt.Printf("  %sCannot connect to Ollama: %v%s\n", cRed, err, cReset)
 			fmt.Printf("  %s⚠ No model backend connected; starting the shell anyway.%s\n", cYellow, cReset)
-			fmt.Printf("  %sStart Ollama with 'ollama serve', or select DeepSeek with /cloudmodel deepseek %s.%s\n",
-				cDim, deepSeekDefaultModel, cReset)
+			fmt.Printf("  %sStart Ollama with 'ollama serve', or select a cloud model with /cloudmodel <deepseek|kimi|kimi-code>.%s\n",
+				cDim, cReset)
 			fmt.Printf("  %sAI turns will fail until a backend is available; /help and !<command> remain usable.%s\n", cDim, cReset)
 			if v := os.Getenv("SECORIZON_NUM_CTX"); v != "" {
 				if n, parseErr := strconv.Atoi(v); parseErr == nil && n >= 2048 {
@@ -6351,21 +6837,26 @@ func main() {
 			}
 		}
 	} else {
-		fmt.Printf("  %sDeepSeek backend selected.%s Type anything. /exit to quit.\n", cGreen, cReset)
+		providerName := cloudProviderDisplayName(cloudProvider)
+		defaultModel, _, contextTokens, promptBudget, _ := cloudProviderDefaults(cloudProvider)
+		fmt.Printf("  %s%s backend selected.%s Type anything. /exit to quit.\n", cGreen, providerName, cReset)
 		if cloudAPIKey == "" {
-			fmt.Printf("  %sDeepSeek credential is not configured — run /cloudmodel deepseek %s%s\n", cYellow, deepSeekDefaultModel, cReset)
+			fmt.Printf("  %s%s credential is not configured — run /cloudmodel %s %s%s\n", cYellow, providerName, cloudProvider, defaultModel, cReset)
 		} else {
 			fmt.Printf("  %scloud credential: configured%s\n", cDim, cReset)
 		}
 		if v := os.Getenv("SECORIZON_NUM_CTX"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil && n >= 2048 {
-				numCtx = min(n, deepSeekContextTokens)
+				numCtx = min(n, contextTokens)
 			}
 		} else {
-			numCtx = deepSeekPromptBudget
+			numCtx = promptBudget
 		}
 		fastMode = numCtx <= 32768
-		fmt.Printf("  %scloud context: provider capability 1M · active harness budget %dK%s\n", cDim, displayContextK(numCtx), cReset)
+		fmt.Printf("  %scloud context: provider capability %s · active harness budget %dK%s\n", cDim, cloudContextCapabilityLabel(cloudProvider, contextTokens), displayContextK(numCtx), cReset)
+		if isKimiBackendValue(cloudProvider) {
+			fmt.Printf("  %sKimi K3 reasoning: always on · effort %s%s\n", cDim, kimiReasoningEffort, cReset)
+		}
 	}
 
 	// Clean up stale temp files from previous sessions for either backend.
@@ -6708,36 +7199,64 @@ func main() {
 					cDim, modelBackend, cloudProvider, cloudModel, cloudBaseURL, strings.TrimSpace(cloudAPIKey) != "", cReset)
 				continue
 			}
-			if len(fields) > 2 || !strings.EqualFold(fields[0], deepSeekProvider) {
-				fmt.Printf("  %sUsage: /cloudmodel deepseek [model]%s\n", cYellow, cReset)
+			selectedProvider := strings.ToLower(fields[0])
+			if len(fields) > 2 || !isCloudBackendValue(selectedProvider) {
+				fmt.Printf("  %sUsage: /cloudmodel <deepseek|kimi|kimi-code> [model]%s\n", cYellow, cReset)
 				continue
 			}
-			selectedCloudModel := cloudModel
-			if selectedCloudModel == "" {
-				selectedCloudModel = deepSeekDefaultModel
+			providerName := cloudProviderDisplayName(selectedProvider)
+			defaultModel, defaultBaseURL, contextTokens, promptBudget, _ := cloudProviderDefaults(selectedProvider)
+			selectedCloudModel := defaultModel
+			selectedBaseURL := defaultBaseURL
+			if cloudProvider == selectedProvider {
+				if strings.TrimSpace(cloudModel) != "" {
+					selectedCloudModel = cloudModel
+				}
+				if strings.TrimSpace(cloudBaseURL) != "" {
+					selectedBaseURL = cloudBaseURL
+				}
+			}
+			if value := strings.TrimSpace(cloudEnvironmentBaseURL(selectedProvider)); value != "" {
+				selectedBaseURL = strings.TrimRight(value, "/")
+				if err := validateCloudEndpoint(selectedProvider, selectedBaseURL); err != nil {
+					fmt.Printf("  %sInvalid %s endpoint: %v%s\n", cRed, providerName, err, cReset)
+					continue
+				}
 			}
 			if len(fields) == 2 {
 				selectedCloudModel = fields[1]
 			}
-			apiKey, err := readSecret("  DeepSeek API key (blank keeps the saved key): ")
+			existingKey := ""
+			if cloudProvider == selectedProvider {
+				existingKey = cloudAPIKey
+			}
+			if strings.TrimSpace(existingKey) == "" {
+				var err error
+				existingKey, err = loadCloudCredentialForProvider(selectedProvider)
+				if err != nil {
+					fmt.Printf("  %sCould not load %s credential: %v%s\n", cRed, providerName, err, cReset)
+					continue
+				}
+			}
+			apiKey, err := readSecret(fmt.Sprintf("  %s API key (blank keeps the saved key): ", providerName))
 			if err != nil {
-				fmt.Printf("  %sCould not read DeepSeek API key: %v%s\n", cRed, err, cReset)
+				fmt.Printf("  %sCould not read %s API key: %v%s\n", cRed, providerName, err, cReset)
 				continue
 			}
 			if strings.TrimSpace(apiKey) == "" {
-				apiKey = cloudAPIKey
+				apiKey = existingKey
 			}
 			if strings.TrimSpace(apiKey) == "" {
-				fmt.Printf("  %sDeepSeek API key is required.%s\n", cRed, cReset)
+				fmt.Printf("  %s%s API key is required.%s\n", cRed, providerName, cReset)
 				continue
 			}
 			apiKey, repaired, err := normalizeCloudAPIKey(apiKey)
 			if err != nil {
-				fmt.Printf("  %sInvalid DeepSeek API key: %v%s\n", cRed, err, cReset)
+				fmt.Printf("  %sInvalid %s API key: %v%s\n", cRed, providerName, err, cReset)
 				continue
 			}
-			if err := saveCloudAPIKey(deepSeekProvider, apiKey); err != nil {
-				fmt.Printf("  %sCould not save DeepSeek credential: %v%s\n", cRed, err, cReset)
+			if err := saveCloudAPIKey(selectedProvider, apiKey); err != nil {
+				fmt.Printf("  %sCould not save %s credential: %v%s\n", cRed, providerName, err, cReset)
 				continue
 			}
 			if repaired {
@@ -6747,16 +7266,18 @@ func main() {
 				localModel = model
 				localOllamaURL = ollamaURL
 			}
-			modelBackend = deepSeekProvider
-			cloudProvider = deepSeekProvider
+			modelBackend = selectedProvider
+			cloudProvider = selectedProvider
 			cloudModel = selectedCloudModel
-			cloudBaseURL = deepSeekDefaultBaseURL
+			cloudBaseURL = selectedBaseURL
 			cloudAPIKey = apiKey
 			model = cloudModel
 			gpus = gpuInfo{}
 			modelMB = 0
 			if strings.TrimSpace(os.Getenv("SECORIZON_NUM_CTX")) == "" {
-				numCtx = deepSeekPromptBudget
+				numCtx = promptBudget
+			} else {
+				numCtx = min(numCtx, contextTokens)
 			}
 			fastMode = numCtx <= 32768
 			if err := persistCurrentModelSelection(); err != nil {
@@ -6766,8 +7287,11 @@ func main() {
 			messages = []message{{Role: "system", Content: messages[0].Content}}
 			updateHistorySnapshot(messages)
 			moduleQueue = nil
-			fmt.Printf("  %sPersistent model backend set to deepseek/%s.%s\n", cGreen, model, cReset)
-			fmt.Printf("  %sContext cleared · active harness budget %dK · provider capability 1M%s\n", cDim, displayContextK(numCtx), cReset)
+			fmt.Printf("  %sPersistent model backend set to %s/%s.%s\n", cGreen, selectedProvider, model, cReset)
+			fmt.Printf("  %sContext cleared · active harness budget %dK · provider capability %s%s\n", cDim, displayContextK(numCtx), cloudContextCapabilityLabel(selectedProvider, contextTokens), cReset)
+			if isKimiBackendValue(selectedProvider) {
+				fmt.Printf("  %sKimi K3 reasoning is always on · effort %s (change with /effort)%s\n", cDim, kimiReasoningEffort, cReset)
+			}
 			continue
 		}
 
@@ -6794,6 +7318,10 @@ func main() {
 			localModel = selectedLocalModel
 			model = selectedLocalModel
 			ollamaURL = localOllamaURL
+			if strings.TrimSpace(os.Getenv("SECORIZON_NUM_CTX")) == "" {
+				numCtx = localContextTokens
+			}
+			fastMode = numCtx <= 32768
 			remoteOllama = ollamaServerIsRemote(ollamaURL)
 			gpus = gpuInfo{}
 			if !remoteOllama {
@@ -6808,14 +7336,14 @@ func main() {
 			updateHistorySnapshot(messages)
 			moduleQueue = nil
 			fmt.Printf("  %sPersistent model backend set to local/%s.%s\n", cGreen, model, cReset)
-			fmt.Printf("  %sContext cleared%s\n", cDim, cReset)
+			fmt.Printf("  %sContext cleared · local context %dK%s\n", cDim, displayContextK(numCtx), cReset)
 			continue
 		}
 
 		if strings.HasPrefix(lower, "/model") {
 			parts := strings.Fields(userInput)
 			if len(parts) > 1 {
-				if modelBackend == deepSeekProvider {
+				if isCloudBackend() {
 					cloudModel = parts[1]
 					model = cloudModel
 					if err := persistCurrentModelSelection(); err != nil {
@@ -6825,7 +7353,7 @@ func main() {
 					messages = []message{{Role: "system", Content: messages[0].Content}}
 					updateHistorySnapshot(messages)
 					moduleQueue = nil
-					fmt.Printf("  %sDeepSeek model set to %s.%s\n", cGreen, model, cReset)
+					fmt.Printf("  %s%s model set to %s.%s\n", cGreen, cloudProviderDisplayName(cloudProvider), model, cReset)
 					fmt.Printf("  %sContext cleared%s\n", cDim, cReset)
 					continue
 				}
@@ -6862,9 +7390,9 @@ func main() {
 				}
 				fmt.Printf("  %sSwitched to %s%s — next message will load it (~10-40s cold).\n", cGreen, model, cReset)
 				fmt.Printf("  %s  Context cleared%s\n", cDim, cReset)
-			} else if modelBackend == deepSeekProvider {
-				fmt.Printf("  %sBackend: deepseek\n  Active: %s\n  Endpoint: %s\n  Credential configured: %t%s\n",
-					cDim, model, cloudBaseURL, strings.TrimSpace(cloudAPIKey) != "", cReset)
+			} else if isCloudBackend() {
+				fmt.Printf("  %sBackend: %s\n  Active: %s\n  Endpoint: %s\n  Credential configured: %t%s\n",
+					cDim, cloudProvider, model, cloudBaseURL, strings.TrimSpace(cloudAPIKey) != "", cReset)
 			} else {
 				fmt.Printf("  %sBackend: local\n  Active: %s\n  Endpoint: %s%s\n", cDim, model, ollamaURL, cReset)
 				for _, name := range mapKeys(models) {
@@ -6883,6 +7411,10 @@ func main() {
 		}
 
 		if lower == "/think" {
+			if isKimiBackendValue(modelBackend) {
+				fmt.Printf("  %sKimi K3 reasoning is always enabled. Use /effort low|high|max to control its depth.%s\n", cDim, cReset)
+				continue
+			}
 			thinkMode = !thinkMode
 			if thinkMode {
 				if modelBackend == deepSeekProvider {
@@ -6900,12 +7432,32 @@ func main() {
 			continue
 		}
 
+		if lower == "/effort" || strings.HasPrefix(lower, "/effort ") {
+			if !isKimiBackendValue(modelBackend) {
+				fmt.Printf("  %s/effort applies only to Kimi K3. The active backend is %s.%s\n", cYellow, modelBackend, cReset)
+				continue
+			}
+			arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(userInput, "/effort")))
+			if arg == "" {
+				fmt.Printf("  %sKimi K3 reasoning effort: %s%s — change with /effort low|high|max\n", cDim, kimiReasoningEffort, cReset)
+				continue
+			}
+			if err := validateKimiReasoningEffort(arg); err != nil {
+				fmt.Printf("  %sInvalid reasoning effort %q (choose low, high, or max).%s\n", cYellow, arg, cReset)
+				continue
+			}
+			kimiReasoningEffort = arg
+			fmt.Printf("  %sKimi K3 reasoning effort set to %s.%s\n", cGreen, kimiReasoningEffort, cReset)
+			continue
+		}
+
 		if lower == "/ctx" || strings.HasPrefix(lower, "/ctx ") {
 			arg := strings.TrimSpace(strings.TrimPrefix(userInput, "/ctx"))
 			if arg == "" {
-				if modelBackend == deepSeekProvider {
-					fmt.Printf("  %sactive harness budget: %d tokens (%dK) · DeepSeek capability: 1M%s — change with /ctx <N>\n",
-						cDim, numCtx, displayContextK(numCtx), cReset)
+				if isCloudBackend() {
+					contextTokens, _ := activeCloudContext()
+					fmt.Printf("  %sactive harness budget: %d tokens (%dK) · %s capability: %s%s — change with /ctx <N>\n",
+						cDim, numCtx, displayContextK(numCtx), cloudProviderDisplayName(cloudProvider), cloudContextCapabilityLabel(cloudProvider, contextTokens), cReset)
 				} else {
 					fmt.Printf("  %scontext window: %d tokens (%dK)%s — change with /ctx <N> (e.g. /ctx 24k, /ctx 65536, /ctx 250000)\n",
 						cDim, numCtx, displayContextK(numCtx), cReset)
@@ -6951,9 +7503,9 @@ func main() {
 					gpuHint = "may span multiple GPUs (slower per-token on consumer cards)"
 				}
 			}
-			if modelBackend == deepSeekProvider {
-				fmt.Printf("  %s%sactive harness budget: %d tokens (%dK)%s — DeepSeek owns the hosted runtime context\n",
-					cGreen, cBold, numCtx, displayContextK(numCtx), cReset)
+			if isCloudBackend() {
+				fmt.Printf("  %s%sactive harness budget: %d tokens (%dK)%s — %s owns the hosted runtime context\n",
+					cGreen, cBold, numCtx, displayContextK(numCtx), cReset, cloudProviderDisplayName(cloudProvider))
 			} else if gpuHint != "" {
 				fmt.Printf("  %s%scontext window: %d tokens (%dK)%s — %s\n",
 					cGreen, cBold, numCtx, displayContextK(numCtx), cReset, gpuHint)
@@ -6970,7 +7522,7 @@ func main() {
 			// Warn if existing context is near the new limit
 			totalChars := 0
 			for _, m := range messages {
-				totalChars += len(m.Content)
+				totalChars += len(m.Content) + len(m.ReasoningContent)
 			}
 			estTokens := totalChars / 4
 			if estTokens > numCtx*9/10 {
@@ -6984,9 +7536,9 @@ func main() {
 			fastMode = !fastMode
 			oldCtx := numCtx
 			if fastMode {
-				if modelBackend == deepSeekProvider {
+				if isCloudBackend() {
 					numCtx = 16384
-					fmt.Printf("  %s%sFast mode: ON%s — %dK active harness budget (DeepSeek runtime context is provider-controlled)\n", cGreen, cBold, cReset, displayContextK(numCtx))
+					fmt.Printf("  %s%sFast mode: ON%s — %dK active harness budget (%s runtime context is provider-controlled)\n", cGreen, cBold, cReset, displayContextK(numCtx), cloudProviderDisplayName(cloudProvider))
 				} else if gpus.count > 0 && modelMB > 0 {
 					numCtx = recommendCtx(gpus, modelMB)
 					fmt.Printf("  %s%sFast mode: ON%s — %dK context (auto-sized for your GPUs)\n", cGreen, cBold, cReset, displayContextK(numCtx))
@@ -6999,11 +7551,12 @@ func main() {
 					}
 				}
 			} else {
-				if modelBackend == deepSeekProvider {
-					numCtx = deepSeekPromptBudget
-					fmt.Printf("  %sFast mode: OFF%s — %dK active harness budget · DeepSeek capability 1M\n", cDim, cReset, displayContextK(numCtx))
+				if isCloudBackend() {
+					contextTokens, promptBudget := activeCloudContext()
+					numCtx = promptBudget
+					fmt.Printf("  %sFast mode: OFF%s — %dK active harness budget · %s capability %s\n", cDim, cReset, displayContextK(numCtx), cloudProviderDisplayName(cloudProvider), cloudContextCapabilityLabel(cloudProvider, contextTokens))
 				} else {
-					numCtx = 250000
+					numCtx = localContextTokens
 					fmt.Printf("  %sFast mode: OFF%s — 250K context, full depth (slower per-token; best for code review, deep AD sessions)\n", cDim, cReset)
 				}
 			}
@@ -7015,12 +7568,12 @@ func main() {
 			// (rough estimate: 4 chars/token).
 			totalChars := 0
 			for _, m := range messages {
-				totalChars += len(m.Content)
+				totalChars += len(m.Content) + len(m.ReasoningContent)
 			}
 			estTokens := totalChars / 4
 			if estTokens > numCtx*9/10 {
 				backendName := "Ollama"
-				if modelBackend == deepSeekProvider {
+				if isCloudBackend() {
 					backendName = "the harness budget"
 				}
 				fmt.Printf("  %s⚠ context (~%d tokens) is near the %dK limit — older messages may be truncated by %s. Use /clear if needed.%s\n",
@@ -7378,7 +7931,7 @@ func main() {
 			messages = messages[:len(messages)-1]
 		}
 
-		messages = append(messages, message{Role: "assistant", Content: response})
+		messages = append(messages, assistantMessageForResponse(response))
 
 		// Check if user input is conversational (greeting/question about the AI) vs a task
 		inputLower := strings.ToLower(strings.TrimSpace(userInput))
@@ -7470,19 +8023,14 @@ func main() {
 		doneNudges := 0
 		reportProduced := false
 
-		// Context-budget escalation: three one-shot nudges injected as the
-		// running conversation grows. Each fires exactly once per turn-sequence.
-		// Tokens estimated as `chars/4` (matches the existing /ctx warning).
-		//   60% — heads-up: aware-but-keep-going
-		//   70% — wrap-up: finish current finding, start the report
-		//   85% — hard stop: emit report NOW, do not promote weak candidates
-		// 85% is the floor for safe report generation; past that, ollama may
-		// silently truncate as numCtx is approached.
-		const (
-			ctxHeadsUpPct  = 60
-			ctxWrapUpPct   = 70
-			ctxHardStopPct = 85
-		)
+		// Context-budget escalation: local Ollama keeps the conservative thresholds
+		// needed to leave generation room inside num_ctx. Hosted 1M models already
+		// reserve 50K outside the 950K harness budget, so their nudges fire near the
+		// actual ceiling instead of prematurely wrapping up around 650-800K.
+		ctxHeadsUpPct, ctxWrapUpPct, ctxHardStopPct := 60, 70, 85
+		if isCloudBackend() {
+			ctxHeadsUpPct, ctxWrapUpPct, ctxHardStopPct = 85, 93, 98
+		}
 		ctxHeadsUpFired := false
 		ctxWrapUpFired := false
 		ctxHardStopFired := false
@@ -7501,7 +8049,7 @@ func main() {
 			if !ctxHardStopFired {
 				totalChars := 0
 				for _, m := range messages {
-					totalChars += len(m.Content)
+					totalChars += len(m.Content) + len(m.ReasoningContent)
 				}
 				estTokens := totalChars / 4
 				actualPct := estTokens * 100 / numCtx
@@ -7638,7 +8186,7 @@ func main() {
 							aborted = true
 							break
 						}
-						messages = append(messages, message{Role: "assistant", Content: response})
+						messages = append(messages, assistantMessageForResponse(response))
 						continue
 					}
 				}
@@ -7659,7 +8207,7 @@ func main() {
 					aborted = true
 					break
 				}
-				messages = append(messages, message{Role: "assistant", Content: response})
+				messages = append(messages, assistantMessageForResponse(response))
 				continue
 			}
 
@@ -7687,7 +8235,7 @@ func main() {
 					aborted = true
 					break
 				}
-				messages = append(messages, message{Role: "assistant", Content: response})
+				messages = append(messages, assistantMessageForResponse(response))
 				continue
 			}
 
@@ -7717,7 +8265,7 @@ func main() {
 					aborted = true
 					break
 				}
-				messages = append(messages, message{Role: "assistant", Content: response})
+				messages = append(messages, assistantMessageForResponse(response))
 				finalParsed := parseModelResponse(response)
 				if finalParsed.Text != "" {
 					fmt.Printf("\n%s\n", sanitizeForTerminal(finalParsed.Text))
@@ -7752,7 +8300,7 @@ func main() {
 					aborted = true
 					break
 				}
-				messages = append(messages, message{Role: "assistant", Content: response})
+				messages = append(messages, assistantMessageForResponse(response))
 				continue
 			}
 
@@ -7772,7 +8320,7 @@ func main() {
 						aborted = true
 						break
 					}
-					messages = append(messages, message{Role: "assistant", Content: response})
+					messages = append(messages, assistantMessageForResponse(response))
 					continue
 				}
 			}
@@ -7890,7 +8438,7 @@ func main() {
 				aborted = true
 				break
 			}
-			messages = append(messages, message{Role: "assistant", Content: response})
+			messages = append(messages, assistantMessageForResponse(response))
 		}
 
 		// Auto-save a report for every clean `done` task. Only the most recent
